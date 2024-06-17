@@ -1,0 +1,35 @@
+[project]
+name = "safetensors-dataset"
+description = "A simple but handy Python library to save [PyTorch](https://pytorch.org) datasets in (SafeTensors)[https://github.com/huggingface/safetensors] format."
+version = "0.0.1"
+license = {text = "Apache 2.0"}
+readme = "README.md"
+
+dependencies = ["safetensors", "torch"]
+requires-python = ">= 3.8"
+
+authors = [
+    { name = "Moritz Hennen", email = "mail@fleance.de" }
+]
+
+keywords = [ "datasets", "saving", "loading", "safetensors" ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+
+    "License :: OSI Approved :: Apache Software License",
+
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+repository = "https://github.com/fleonce/safetensors-dataset/"
+
+[tool.setuptools]
+packages = ["safetensors_dataset"]
