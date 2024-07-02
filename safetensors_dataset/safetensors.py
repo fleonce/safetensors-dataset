@@ -84,20 +84,21 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     raise ValueError(f"Dtype {v[0].dtype} is unsupported for sparse tensors (Key = {k})")
 
                 if hasattr(torch, "_nested_view_from_buffer"):
+                    if any(elem.is_nested for elem in v):
+                        raise ValueError(f"Supplying a list of nested tensors is not allowed")
                     nested_tensor = torch.nested.as_nested_tensor(v)
-                    assert all(i.dim() == 1 for i in v), (f"Unsupported number of dimensions for nested tensor "
-                                                          f"'{k}'")
-                    buffer = torch.cat(v, dim=-1)
+                    buffer = nested_tensor.values()
                     tensors[f"{k}.buffer"] = buffer
                     tensors[f"{k}.sizes"] = nested_tensor._nested_tensor_size()
                     tensors[f"{k}.strides"] = nested_tensor._nested_tensor_strides()
                     tensors[f"{k}.storage_offsets"] = nested_tensor._nested_tensor_storage_offsets()
                     metadata[k] = {"nested": True}
                 else:
-                    warnings.warn(f"Storing lists of (small) tensors is slow with safetensors, a recent PyTorch "
-                                    f"nightly is required to handle this case efficiently. Install via. "
-                                    f"'pip3 install --pre torch "
-                                    f"--index-url https://download.pytorch.org/whl/nightly/cu118'")
+                    warnings.warn(
+                        f"Storing lists of (small) tensors is slow with safetensors, a recent PyTorch "
+                        f"version is required to handle this case efficiently. Install via. "
+                        f"'pip3 install \"torch>=2.1.0\" "
+                    )
                     for i, t in enumerate(v):
                         tensors[f"{k}.{i}"] = t
 
