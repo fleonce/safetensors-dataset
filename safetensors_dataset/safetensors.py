@@ -48,7 +48,8 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         raise ValueError(f"{type(i)} is unknown ({i})")
 
     def __getitems__(self, indices: list[int, ...]):
-        return {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
+        elements_per_key = {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
+        return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
     @staticmethod
     def _get_items_from_tensor(t: torch.Tensor, indices: list[int, ...]):
