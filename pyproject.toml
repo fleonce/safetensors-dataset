@@ -1,11 +1,11 @@
 [project]
 name = "safetensors-dataset"
 description = "A simple but handy Python library to save PyTorch datasets in safetensors format."
-version = "0.0.3"
+version = "0.0.4rc1"
 license = {text = "Apache 2.0"}
 readme = "README.md"
 
-dependencies = ["safetensors", "torch"]
+dependencies = ["safetensors", "torch", "tqdm"]
 requires-python = ">= 3.8"
 
 authors = [

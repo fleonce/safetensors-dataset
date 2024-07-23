@@ -2,10 +2,12 @@ import json
 import re
 import warnings
 from collections import OrderedDict
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import safetensors.torch
+from tqdm import trange
 import torch
 import torch.utils.data
 
@@ -17,7 +19,21 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __init__(self, dataset=None):
         self.dataset = dataset or {}
 
-    def __getitem__(self, i):
+    def filter(
+        self,
+        filter_fn: Callable[[dict[str, torch.Tensor]], bool],
+        tqdm: bool = True
+    ):
+        filtered_dataset = dict({k: list() for k in self.dataset.keys()})
+        from_to = range if not tqdm else partial(trange, leave=False)
+        for i in from_to(len(self)):
+            elem = self[i]
+            if filter_fn(elem):
+                for k in filtered_dataset.keys():
+                    filtered_dataset[k].append(elem[k])
+        return SafetensorsDataset(filtered_dataset)
+
+    def __getitem__(self, i) -> dict[str, torch.Tensor]:
         return {k: v[i] for k, v in self.dataset.items()}
 
     def __len__(self):
