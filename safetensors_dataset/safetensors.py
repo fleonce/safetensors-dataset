@@ -36,8 +36,35 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __getitem__(self, i) -> dict[str, torch.Tensor]:
         return {k: v[i] for k, v in self.dataset.items()}
 
+    def __getitems__(self, indices: list[int, ...]):
+        elements_per_key = {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
+        return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
+
     def __len__(self):
         return next((self._get_len_of_item(v) for v in self.dataset.values()), 0)
+
+    def __repr__(self):
+        def nice_shape(shape):
+            return "[" + " x ".join(map(str, shape)) + "]"
+
+        def shape_for_elem(elem):
+            is_tensor = isinstance(elem, torch.Tensor)
+            if is_tensor and not elem.is_nested:
+                return nice_shape(elem.shape)
+            elif isinstance(elem, list) or (is_tensor and elem.is_nested):
+                shape = (len(elem) if not is_tensor else elem.size(0), )
+                inner_shape = None
+                for list_elem in elem:
+                    inner_shape = inner_shape or list_elem.shape
+                    inner_shape = tuple(map(max, inner_shape, list_elem.shape))
+                shape = shape + inner_shape
+                return nice_shape(shape)
+            else:
+                raise ValueError(f"Unknown element type {type(elem)}")
+        shapes = str({k: shape_for_elem(v) for k, v in self.dataset.items()})
+        size = len(self)
+
+        return f"SafetensorsDataset(size={size}, shapes={shapes})"
 
     @staticmethod
     def _get_len_of_item(i):
@@ -46,10 +73,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         elif isinstance(i, list):
             return len(i)
         raise ValueError(f"{type(i)} is unknown ({i})")
-
-    def __getitems__(self, indices: list[int, ...]):
-        elements_per_key = {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
-        return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
     @staticmethod
     def _get_items_from_tensor(t: torch.Tensor, indices: list[int, ...]):
