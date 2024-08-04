@@ -1,15 +1,20 @@
 import json
-import re
 import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import safetensors.torch
 from tqdm import trange
 import torch
 import torch.utils.data
+
+
+pack_tensor_t = dict[str, torch.Tensor]
+pack_metadata_t = dict[str, Any] | None
+pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
+can_pack_nested_tensors_fast = hasattr(torch, "_nested_view_from_buffer")
 
 
 class SafetensorsDataset(torch.utils.data.Dataset):
@@ -80,67 +85,120 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             return [t[i] for i in indices]
         return t[indices]
 
-    _dtype_to_str = {
-        torch.bool: "bool",
-        torch.long: "long",
-    }
-    _str_to_dtype = {"long": torch.long, "bool": torch.bool}
+    @staticmethod
+    def pack_single_tensor(key: str, tensor: torch.Tensor) -> pack_return_t:
+        pack: pack_tensor_t
+        metadata: pack_metadata_t
+        if tensor.is_sparse:
+            pack = {
+                key + ".values": tensor.values(),
+                key + ".indices": tensor.values()
+            }
+            metadata = {
+                "sparse": True,
+                "dtype": repr(tensor.dtype),
+                "dims": tensor.shape,
+                "numel": 1,
+            }
+            return pack, metadata
+        elif tensor.is_nested:
+            if not can_pack_nested_tensors_fast:
+                raise ValueError(
+                    "To efficiently store and load nested tensors, a recent version of pytorch >= 2.1.0 is required."
+                )
+            buffer = tensor.values()
+            pack = {
+                key + ".buffer": buffer,
+                key + ".sizes": tensor._nested_tensor_size()
+            }
+            metadata = {
+                "nested": True,
+                "dtype": repr(tensor.dtype),
+                "numel": 1,
+            }
+            return pack, metadata
+        return {key: tensor}, None
+
+    def pack_tensor_list(self, key: str, tensors: list[torch.Tensor]) -> pack_return_t:
+        if len(tensors) == 0:
+            raise ValueError(f"Cannot save an empty list of tensors for key '{key}'")
+        if not isinstance(tensors[0], torch.Tensor):
+            raise ValueError(f"Elements of '{key}' are no tensors ... element 0 is {type(tensors[0])}")
+        if len(tensors) != len(self):
+            raise ValueError(f"'{key}' should have {len(self)} elements, but has {len(tensors)}")
+
+        dims = map(torch.Tensor.dim, tensors)  # noqa
+        if max(dims) > min(dims):
+            raise ValueError(f"Elements of '{key}' are of different dimensionality")
+
+        is_sparse = any(map(lambda x: x.is_sparse, tensors))
+        is_nested = any(map(lambda x: x.is_nested, tensors))
+        if is_sparse and is_nested:
+            raise ValueError(f"Cannot pack a mixed list of sparse and nested tensors for key '{key}'")
+
+        if is_sparse:
+            sparse_shape = tuple(max(map(lambda x: x.size(dim), tensors)) for dim in range(min(dims)))
+            same_size_tensors = list(map(lambda t: torch.sparse_coo_tensor(t.indices(), t.values(), size=sparse_shape), tensors))
+            sparse_tensor = torch.stack(same_size_tensors, dim=0).coalesce()
+            if sparse_tensor.dtype == torch.bool:
+                pack = {key: sparse_tensor}
+            else:
+                pack = {key + ".indices": sparse_tensor.indices(), key + ".values": sparse_tensor.values()}
+            metadata = {
+                "sparse": True,
+                "dims": sparse_tensor.shape,
+                "dtype": sparse_tensor.dtype,
+                "numel": len(tensors)
+            }
+            return pack, metadata
+
+        if not can_pack_nested_tensors_fast:
+            warnings.warn(
+                f"To efficiently store and load nested tensors, a recent version of pytorch >= 2.1.0 is required, "
+                f"you are on {torch.__version__}"
+            )
+            pack = dict()
+            for index, elem in enumerate(tensors):
+                pack[key + "." + str(index)] = elem
+            metadata = {"list": True, "numel": len(tensors)}
+            return pack, metadata
+        else:
+            if is_nested:
+                nested_tensor = torch.stack(tensors)
+            else:
+                nested_tensor = torch.nested.nested_tensor(tensors)
+            pack = {
+                key + ".buffer": nested_tensor.values(),
+                key + ".sizes": nested_tensor._nested_tensor_size()
+            }
+            if nested_tensor.dim() > 2:
+                pack = pack | {
+                    key + ".strides": nested_tensor._nested_tensor_strides(),
+                    key + ".storage_offsets": nested_tensor._nested_tensor_storage_offsets()
+                }
+            metadata = {"nested": True, "numel": len(tensors)}
+            return pack, metadata
 
     def save_to_file(self, path: Path):
-        metadata = {"size": len(self)}
+        def check_key(key: str):
+            if "." in key:
+                raise ValueError(f". is not allowed in a safetensors dataset (used in {key})")
+
+        metadata = {"size": len(self), "version": None}
         tensors = OrderedDict()
         for k, v in self.dataset.items():
-            if isinstance(v, torch.Tensor) and not v.is_sparse:
-                tensors[k] = v
-            elif isinstance(v, torch.Tensor) and v.is_sparse:
-                raise ValueError()
+            check_key(k)
+
+            pack, pack_metadata = None, None
+            if isinstance(v, torch.Tensor):
+                pack, pack_metadata = self.pack_single_tensor(k, v)
             elif isinstance(v, list):
-                assert len(v) > 0
-                assert isinstance(v[0], torch.Tensor)
-                assert len(v) == metadata.get("size"), \
-                    f"Length of values for '{k}' ({len(v)}) does not match dataset length {metadata.get('size')}"
-                if v[0].is_sparse and v[0].dtype in self._dtype_to_str:
-                    v_zero: torch.Tensor = v[0]
-                    max_dim = [max([vs.size(i) for vs in v]) for i in range(v_zero.dim())]
-                    metadata[k] = {"sparse": True, "dims": max_dim, "dtype": self._dtype_to_str.get(v[0].dtype)}
+                pack, pack_metadata = self.pack_tensor_list(k, v)
 
-                    def list_of_sparse_tensors_to_uniform_size(lis):
-                        return [torch.sparse_coo_tensor(vs.indices(), vs.values(), size=max_dim) for vs in lis]
-
-                    vvs = list_of_sparse_tensors_to_uniform_size(v)
-
-                    def stack_list_of_sparse_tensors(lis) -> torch.Tensor:
-                        return torch.stack(lis, dim=0).coalesce()
-
-                    vvs = stack_list_of_sparse_tensors(vvs)
-                    if vvs.dtype == torch.bool:
-                        vvs = vvs.indices()
-                        tensors[k] = vvs
-                    else:
-                        tensors[f"{k}.indices"] = vvs.indices()
-                        tensors[f"{k}.values"] = vvs.values()
-                    continue
-                elif v[0].is_sparse and v[0].dtype not in self._dtype_to_str:
-                    raise ValueError(f"Dtype {v[0].dtype} is unsupported for sparse tensors (Key = {k})")
-
-                if hasattr(torch, "_nested_view_from_buffer"):
-                    if any(elem.is_nested for elem in v):
-                        raise ValueError(f"Supplying a list of nested tensors is not allowed")
-                    nested_tensor = torch.nested.as_nested_tensor(v)
-                    buffer = nested_tensor.values()
-                    tensors[f"{k}.buffer"] = buffer
-                    tensors[f"{k}.sizes"] = nested_tensor._nested_tensor_size()
-                    tensors[f"{k}.strides"] = nested_tensor._nested_tensor_strides()
-                    tensors[f"{k}.storage_offsets"] = nested_tensor._nested_tensor_storage_offsets()
-                    metadata[k] = {"nested": True}
-                else:
-                    warnings.warn(
-                        f"Storing lists of (small) tensors is slow with safetensors, a recent PyTorch "
-                        f"version is required to handle this case efficiently. Install via. "
-                        f"'pip3 install \"torch>=2.1.0\" "
-                    )
-                    for i, t in enumerate(v):
-                        tensors[f"{k}.{i}"] = t
+            if pack is not None:
+                tensors.update(pack)
+                if pack_metadata is not None:
+                    metadata[k] = pack_metadata
 
         metadata = {k: json.dumps(v) for k, v in metadata.items()}
         safetensors.torch.save_file(tensors, path, metadata=metadata)
@@ -152,19 +210,23 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         dataset = {}
         keys = set()
         for k in tensors.keys():
-            if not re.search(r"\.[0-9]+$", k):  # not endswith(number)
-                info = k.split('.')
-                if len(info) > 1:
-                    keys.add('.'.join(info[:-1]))
-                else:
-                    keys.add(k)
+            if "." in k:
+                # a key in the dataset may be stored with multiple keys in the underlying structure
+                # f. e. '.values' and '.indices'
+                info = k.split(".")
+                keys.add('.'.join(info[:-1]))
             else:
-                match = re.search(r"\.[0-9]+$", k)
-                keys.add(k[:match.start()])
+                keys.add(k)
 
+        size = metadata.get("size")
         for k in keys:
+            meta: Mapping[str, Any] = metadata.get(k, dict())
+            if not meta:
+                # load a single tensor
+                v = tensors[k]
+            if not meta or meta.get("list", False):
+                pass
             if k not in metadata:
-                size = metadata.get("size")
                 v = [None for _ in range(size)]
                 for i in range(size):
                     v[i] = tensors.get(f"{k}.{i}")
