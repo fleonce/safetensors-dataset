@@ -86,6 +86,51 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return t[indices]
 
     @staticmethod
+    def unpack_list_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+        numel = meta.get("numel")
+        tensors = list()
+        for elem in range(numel):
+            tensors.append(storage.get(key + str(elem)))
+        return torch.nested.nested_tensor(tensors)
+
+    @staticmethod
+    def unpack_nested_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+        buffer = storage[key + ".buffer"]
+        sizes = storage[key + ".sizes"]
+        if key + ".strides" in storage:
+            strides = storage[key + ".strides"]
+        else:
+            strides = torch.ones_like(sizes)
+        if key + ".storage_offsets" in storage:
+            storage_offsets = storage[key + ".storage_offsets"]
+        else:
+            storage_offsets = sizes * strides
+            storage_offsets = storage_offsets.cumsum(dim=0)
+            storage_shape = storage_offsets.shape
+            storage_zeros = storage_offsets.new_zeros(storage_shape[:-1] + (1,))
+            storage_offsets = torch.cat((storage_zeros, storage_offsets), dim=-1)
+            storage_offsets = storage_offsets[..., :-1]
+        tensor = torch._nested_view_from_buffer(buffer, sizes, strides, storage_offsets)
+        return tensor
+
+    @staticmethod
+    def unpack_sparse_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+        dims = meta.get("dims")
+        dtype = meta.get("dtype")
+        if dtype == torch.bool and key + ".indices" not in storage:
+            tensor = storage[key]
+            tensor = torch.sparse_coo_tensor(tensor, torch.ones_like(tensor, dtype=dtype), size=dims)
+            tensor = tensor.coalesce()
+        else:
+            indices = storage[key + ".indices"]
+            if key + ".values" not in storage:
+                raise ValueError(f"Need {key}.values to restore sparsely stored tensor")
+            values = storage[key + ".values"]
+            tensor = torch.sparse_coo_tensor(indices, values, size=dims)
+            tensor = tensor.coalesce()
+        return tensor
+
+    @staticmethod
     def pack_single_tensor(key: str, tensor: torch.Tensor) -> pack_return_t:
         pack: pack_tensor_t
         metadata: pack_metadata_t
@@ -218,49 +263,20 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             else:
                 keys.add(k)
 
-        size = metadata.get("size")
         for k in keys:
             meta: Mapping[str, Any] = metadata.get(k, dict())
             if not meta:
                 # load a single tensor
-                v = tensors[k]
-            if meta.get("sparse", False) is True:
-                v = cls.unpack_sparse_entry(v, meta)
-            elif meta.get("")
-            if not meta or meta.get("list", False):
-                pass
-            if k not in metadata:
-                v = [None for _ in range(size)]
-                for i in range(size):
-                    v[i] = tensors.get(f"{k}.{i}")
+                tensor = tensors[k]
+            elif meta.get("sparse", False) is True:
+                tensor = cls.unpack_sparse_tensor(k, meta, tensors)
+            elif meta.get("nested", False) is True:
+                tensor = cls.unpack_nested_tensor(k, meta, tensors)
+            elif meta.get("list", False):
+                tensor = cls.unpack_list_tensor(k, meta, tensors)
             else:
-                element_metadata = metadata[k]
-                if element_metadata.get("sparse", False):
-                    dense_dtype = cls._str_to_dtype.get(element_metadata.get("dtype"))
-                    dense_size = (metadata.get("size"), *element_metadata.get("dims"))
-                    if dense_dtype == torch.bool:
-                        v = tensors[k]
-                        v = torch.sparse_coo_tensor(v, torch.ones(v.size(-1), dtype=torch.bool), size=dense_size)
-                    else:
-                        v = tensors[k + ".indices"]
-                        if k + ".values" not in tensors:
-                            raise ValueError(f"Key '{k}.values' was not saved in '{path.as_posix()}'")
-                        vals = tensors[k + ".values"]
-                        v = torch.sparse_coo_tensor(v, vals, size=dense_size)
-                    v = v.coalesce()
-                elif element_metadata.get("nested", False):
-                    assert hasattr(torch, "_nested_view_from_buffer"), \
-                        (f"To load nested values, a very recent torch nightly is required. Install via "
-                         f"'pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu118'")
-                    buffer = tensors[k + ".buffer"]
-                    sizes = tensors[k + ".sizes"]
-                    strides = tensors[k + ".strides"]
-                    storage_offsets = tensors[k + ".storage_offsets"]
-                    v = torch._nested_view_from_buffer(buffer, sizes, strides, storage_offsets)
-                else:
-                    raise ValueError(f"Dont know how to handle key {k} with metadata {element_metadata}")
-
-            dataset[k] = v
+                raise ValueError(f"Cannot unpack stored tensor {k} with metadata = {meta}")
+            dataset[k] = tensor
         return SafetensorsDataset(dataset)
 
     @staticmethod
