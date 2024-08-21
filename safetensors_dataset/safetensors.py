@@ -224,6 +224,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             if not meta:
                 # load a single tensor
                 v = tensors[k]
+            if meta.get("sparse", False) is True:
+                v = cls.unpack_sparse_entry(v, meta)
+            elif meta.get("")
             if not meta or meta.get("list", False):
                 pass
             if k not in metadata:

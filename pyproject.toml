@@ -35,4 +35,4 @@ repository = "https://github.com/fleonce/safetensors-dataset/"
 packages = ["safetensors_dataset"]
 
 [tool.setuptools.dynamic]
-version = {attr = "safetensors_dataset.__version__"}
+version = {attr = "safetensors_dataset.version.__version__"}

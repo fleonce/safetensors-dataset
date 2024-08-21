@@ -5,7 +5,7 @@ from pathlib import Path
 from with_argparse import with_argparse
 
 UNKNOWN = "Unknown"
-RELEASE_PATTERN = re.compile(r"/v[0-9]+(\.[0-9]+)*(-rc[0-9]+)?/")
+RELEASE_PATTERN = re.compile(r"[0-9]+(\.[0-9]+)*")
 
 
 # amended from
@@ -35,7 +35,7 @@ def generate_version():
         print("Cannot create version file, no tag set for build ...")
         exit(1)
     with open(version_file, "w") as f:
-        f.write(f"__version__ = {version}\n")
+        f.write(f"__version__ = '{version}'\n")
 
 
 if __name__ == "__main__":
