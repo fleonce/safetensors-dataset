@@ -3,13 +3,13 @@ import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, overload
 
 import safetensors.torch
 from tqdm import trange
 import torch
 import torch.utils.data
-
+from .utils import _get_torch_dtype_from_str
 
 pack_tensor_t = dict[str, torch.Tensor]
 pack_metadata_t = dict[str, Any] | None
@@ -38,8 +38,13 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     filtered_dataset[k].append(elem[k])
         return SafetensorsDataset(filtered_dataset)
 
-    def __getitem__(self, i) -> dict[str, torch.Tensor]:
-        return {k: v[i] for k, v in self.dataset.items()}
+    def keys(self) -> set[str]:
+        return set(self.dataset.keys())
+
+    def __getitem__(self, item: int | str) -> dict[str, torch.Tensor] | torch.Tensor:
+        if isinstance(item, str):
+            return self.dataset[item]
+        return {k: v[item] for k, v in self.dataset.items()}
 
     def __getitems__(self, indices: list[int, ...]):
         elements_per_key = {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
@@ -117,9 +122,10 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def unpack_sparse_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
         dims = meta.get("dims")
         dtype = meta.get("dtype")
+        dtype = _get_torch_dtype_from_str(dtype)
         if dtype == torch.bool and key + ".indices" not in storage:
             tensor = storage[key]
-            tensor = torch.sparse_coo_tensor(tensor, torch.ones_like(tensor, dtype=dtype), size=dims)
+            tensor = torch.sparse_coo_tensor(tensor, torch.ones(tensor.size(-1), dtype=dtype), size=tuple(dims))
             tensor = tensor.coalesce()
         else:
             indices = storage[key + ".indices"]
@@ -135,10 +141,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         pack: pack_tensor_t
         metadata: pack_metadata_t
         if tensor.is_sparse:
-            pack = {
-                key + ".values": tensor.values(),
-                key + ".indices": tensor.values()
-            }
+            if tensor.dtype == torch.bool:
+                pack = {
+                    key: tensor.indices()
+                }
+            else:
+                pack = {
+                    key + ".values": tensor.values(),
+                    key + ".indices": tensor.indices()
+                }
             metadata = {
                 "sparse": True,
                 "dtype": repr(tensor.dtype),
@@ -185,8 +196,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             sparse_shape = tuple(max(map(lambda x: x.size(dim), tensors)) for dim in range(min(dims)))
             same_size_tensors = list(map(lambda t: torch.sparse_coo_tensor(t.indices(), t.values(), size=sparse_shape), tensors))
             sparse_tensor = torch.stack(same_size_tensors, dim=0).coalesce()
+            assert False, sparse_tensor.dtype
             if sparse_tensor.dtype == torch.bool:
-                pack = {key: sparse_tensor}
+                pack = {key: sparse_tensor.indices()}
             else:
                 pack = {key + ".indices": sparse_tensor.indices(), key + ".values": sparse_tensor.values()}
             metadata = {
@@ -250,7 +262,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
     @classmethod
     def load_from_file(cls, path: Path):
-        metadata = cls.load_safetensors_metadata(path)  # {"size": len}
+        metadata = cls._load_safetensors_metadata(path)  # {"size": len}
         tensors = safetensors.torch.load_file(path, device="cpu")
         dataset = {}
         keys = set()
@@ -310,7 +322,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return cls.from_dict(out)
 
     @staticmethod
-    def load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
+    def _load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
         with open(fp, 'rb') as f:
             n_bytes = f.read(8)
             n_bytes = int.from_bytes(n_bytes, byteorder='little', signed=False)
