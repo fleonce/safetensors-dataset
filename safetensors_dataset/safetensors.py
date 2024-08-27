@@ -211,7 +211,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             metadata = {
                 "sparse": True,
                 "dims": sparse_tensor.shape,
-                "dtype": sparse_tensor.dtype,
+                "dtype": repr(sparse_tensor.dtype),
                 "numel": len(tensors)
             }
             return pack, metadata
