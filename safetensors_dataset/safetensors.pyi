@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, overload
+from typing import Callable, overload, Self
 
 import torch.utils.data
 from torch import Tensor
@@ -8,6 +8,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __init__(self, dataset=None):
         pass
 
+    def pack(self) -> Self:
+        return self
+
     def filter(self, filter_fn: Callable[[dict[str, Tensor]], bool], tqdm: bool = True) -> "SafetensorsDataset":
         pass
 
@@ -15,7 +18,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         pass
 
     @overload
-    def __getitem__(self, item: str) -> Tensor:
+    def __getitem__(self, item: str) -> Tensor | list[Tensor]:
         pass
     @overload
     def __getitem__(self, item: int) -> dict[str, Tensor]:
@@ -35,7 +38,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         pass
 
     @classmethod
-    def from_dict(cls, x: dict[str, Tensor]) -> SafetensorsDataset:
+    def from_dict(cls, x: dict[str, Tensor | list[Tensor]]) -> SafetensorsDataset:
         pass
 
     @classmethod

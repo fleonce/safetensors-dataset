@@ -9,6 +9,8 @@ import safetensors.torch
 from tqdm import trange
 import torch
 import torch.utils.data
+from typing_extensions import Self
+
 from .utils import _get_torch_dtype_from_str
 
 pack_tensor_t = dict[str, torch.Tensor]
@@ -37,6 +39,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 for k in filtered_dataset.keys():
                     filtered_dataset[k].append(elem[k])
         return SafetensorsDataset(filtered_dataset)
+
+    def pack(self) -> Self:
+        for key in self.keys():
+            if isinstance(self[key], list):
+                self.dataset[key] = torch.nested.nested_tensor(self.dataset[key])
+        return self
 
     def keys(self) -> set[str]:
         return set(self.dataset.keys())
@@ -183,7 +191,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         if len(tensors) != len(self):
             raise ValueError(f"'{key}' should have {len(self)} elements, but has {len(tensors)}")
 
-        dims = map(torch.Tensor.dim, tensors)  # noqa
+        dims = set(map(torch.Tensor.dim, tensors))  # noqa
         if max(dims) > min(dims):
             raise ValueError(f"Elements of '{key}' are of different dimensionality")
 
@@ -196,7 +204,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             sparse_shape = tuple(max(map(lambda x: x.size(dim), tensors)) for dim in range(min(dims)))
             same_size_tensors = list(map(lambda t: torch.sparse_coo_tensor(t.indices(), t.values(), size=sparse_shape), tensors))
             sparse_tensor = torch.stack(same_size_tensors, dim=0).coalesce()
-            assert False, sparse_tensor.dtype
             if sparse_tensor.dtype == torch.bool:
                 pack = {key: sparse_tensor.indices()}
             else:
@@ -306,12 +313,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         assert not empty_keys, f"Found {len(empty_keys)} keys with empty lists as values: {', '.join(empty_keys)}"
 
     @classmethod
-    def from_dict(cls, x: dict):
+    def from_dict(cls, x: dict[str, torch.Tensor | list[torch.Tensor]]):
         cls._check_input_dict(x)
         return SafetensorsDataset(x)
 
     @classmethod
-    def from_list(cls, x: list[dict]):
+    def from_list(cls, x: list[dict[str, torch.Tensor]]):
         out = {}
         for i in x:
             for k, v in i.items():

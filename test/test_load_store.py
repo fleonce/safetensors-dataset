@@ -40,6 +40,12 @@ class StoreDatasetTestCase(TestCase):
             self.check_tensors_are_equal(dataset[key], comparison[key])
 
     def check_tensors_are_equal(self, tensor: torch.Tensor, comparison: torch.Tensor):
+        self.assertEqual(isinstance(tensor, list), isinstance(comparison, list))
+        if isinstance(tensor, list):
+            self.assertEqual(len(tensor), len(comparison))
+            for elem, compare in zip(tensor, comparison):
+                self.check_tensors_are_equal(elem, compare)
+            return None
         self.assertEqual(tensor.is_nested, comparison.is_nested)
         self.assertEqual(tensor.is_sparse, comparison.is_sparse)
         if tensor.is_nested:
@@ -78,3 +84,11 @@ class StoreDatasetTestCase(TestCase):
         })
         loaded_dataset = self.store_and_reload_dataset(dataset)
         self.check_datasets_are_equal(dataset, loaded_dataset)
+
+    @check_dtypes(torch.float, torch.bfloat16)
+    def test_store_list_dataset(self, dtype: torch.dtype):
+        lengths = range(10)
+        tensors = [torch.randn(length, dtype=dtype) for length in lengths]
+        dataset = SafetensorsDataset.from_dict({"values": tensors})
+        loaded_dataset = self.store_and_reload_dataset(dataset)
+        self.check_datasets_are_equal(dataset.pack(), loaded_dataset)
