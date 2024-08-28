@@ -1,47 +1,53 @@
 from pathlib import Path
-from typing import Callable, overload, Self
+from typing import Callable, overload, Self, Mapping, Any
 
 import torch.utils.data
 from torch import Tensor
+
+pack_tensor_t = dict[str, torch.Tensor]
+pack_metadata_t = dict[str, Any] | None
+pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
 
 class SafetensorsDataset(torch.utils.data.Dataset):
     def __init__(self, dataset=None):
         pass
 
-    def pack(self) -> Self:
-        return self
+    def pack(self) -> Self: ...
 
-    def filter(self, filter_fn: Callable[[dict[str, Tensor]], bool], tqdm: bool = True) -> "SafetensorsDataset":
-        pass
+    def filter(self, filter_fn: Callable[[dict[str, Tensor]], bool], tqdm: bool = True) -> "SafetensorsDataset": ...
 
-    def keys(self) -> set[str]:
-        pass
+    def keys(self) -> set[str]: ...
 
     @overload
-    def __getitem__(self, item: str) -> Tensor | list[Tensor]:
-        pass
+    def __getitem__(self, item: str) -> Tensor | list[Tensor]: ...
     @overload
-    def __getitem__(self, item: int) -> dict[str, Tensor]:
-        pass
+    def __getitem__(self, item: int) -> dict[str, Tensor]: ...
 
-    def __getitems__(self, items: list[int, ...]) -> list[dict[str, Tensor], ...]:
-        pass
+    def __getitems__(self, items: list[int, ...]) -> list[dict[str, Tensor], ...]: ...
 
-    def __len__(self) -> int:
-        pass
+    def __len__(self) -> int: ...
 
-    def save_to_file(self, path: Path):
-        pass
+    def save_to_file(self, path: Path): ...
 
     @classmethod
-    def load_from_file(cls, path: Path) -> SafetensorsDataset:
-        pass
+    def load_from_file(cls, path: Path) -> SafetensorsDataset: ...
 
     @classmethod
-    def from_dict(cls, x: dict[str, Tensor | list[Tensor]]) -> SafetensorsDataset:
-        pass
+    def from_dict(cls, x: dict[str, Tensor | list[Tensor]]) -> SafetensorsDataset: ...
 
     @classmethod
-    def from_list(cls, x: list[dict[str, Tensor]]) -> SafetensorsDataset:
-        pass
+    def from_list(cls, x: list[dict[str, Tensor]]) -> SafetensorsDataset: ...
 
+    @staticmethod
+    def unpack_list_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]): ...
+
+    @staticmethod
+    def unpack_nested_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]): ...
+
+    @staticmethod
+    def unpack_sparse_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]): ...
+
+    @staticmethod
+    def pack_single_tensor(key: str, tensor: torch.Tensor) -> pack_return_t: ...
+
+    def pack_tensor_list(self, key: str, tensors: list[torch.Tensor]) -> pack_return_t: ...

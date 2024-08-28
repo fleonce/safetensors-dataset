@@ -3,7 +3,7 @@ import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, overload
+from typing import Any, Callable, Mapping
 
 import safetensors.torch
 from tqdm import trange
@@ -11,7 +11,8 @@ import torch
 import torch.utils.data
 from typing_extensions import Self
 
-from .utils import _get_torch_dtype_from_str
+from safetensors_dataset.version import __version__
+from safetensors_dataset.utils import get_torch_dtype_from_str
 
 pack_tensor_t = dict[str, torch.Tensor]
 pack_metadata_t = dict[str, Any] | None
@@ -43,6 +44,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def pack(self) -> Self:
         for key in self.keys():
             if isinstance(self[key], list):
+                if any(elem.is_sparse for elem in self[key]):
+                    self.dataset[key] = torch.stack(self.dataset[key], dim=0).coalesce()
+                    continue
                 self.dataset[key] = torch.nested.nested_tensor(self.dataset[key])
         return self
 
@@ -99,7 +103,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return t[indices]
 
     @staticmethod
-    def unpack_list_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+    def unpack_list_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
         numel = meta.get("numel")
         tensors = list()
         for elem in range(numel):
@@ -107,7 +111,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return torch.nested.nested_tensor(tensors)
 
     @staticmethod
-    def unpack_nested_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+    def unpack_nested_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
         buffer = storage[key + ".buffer"]
         sizes = storage[key + ".sizes"]
         if key + ".strides" in storage:
@@ -127,10 +131,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return tensor
 
     @staticmethod
-    def unpack_sparse_tensor(key: str, meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+    def unpack_sparse_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
+        numel = meta.get("numel")
+        if not numel:
+            numel = metadata.get("size")
         dims = meta.get("dims")
+        if numel != dims[0]:
+            dims = (numel,) + tuple(dims)
         dtype = meta.get("dtype")
-        dtype = _get_torch_dtype_from_str(dtype)
+        dtype = get_torch_dtype_from_str(dtype)
         if dtype == torch.bool and key + ".indices" not in storage:
             tensor = storage[key]
             tensor = torch.sparse_coo_tensor(tensor, torch.ones(tensor.size(-1), dtype=dtype), size=tuple(dims))
@@ -162,7 +171,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 "sparse": True,
                 "dtype": repr(tensor.dtype),
                 "dims": tensor.shape,
-                "numel": 1,
+                "numel": tensor.size(0),
             }
             return pack, metadata
         elif tensor.is_nested:
@@ -178,7 +187,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             metadata = {
                 "nested": True,
                 "dtype": repr(tensor.dtype),
-                "numel": 1,
+                "numel": tensor.size(0),
             }
             return pack, metadata
         return {key: tensor}, None
@@ -248,7 +257,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             if "." in key:
                 raise ValueError(f". is not allowed in a safetensors dataset (used in {key})")
 
-        metadata = {"size": len(self), "version": None}
+        metadata = {"size": len(self), "version": __version__}
         tensors = OrderedDict()
         for k, v in self.dataset.items():
             check_key(k)
@@ -288,11 +297,11 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 # load a single tensor
                 tensor = tensors[k]
             elif meta.get("sparse", False) is True:
-                tensor = cls.unpack_sparse_tensor(k, meta, tensors)
+                tensor = cls.unpack_sparse_tensor(k, metadata, meta, tensors)
             elif meta.get("nested", False) is True:
-                tensor = cls.unpack_nested_tensor(k, meta, tensors)
+                tensor = cls.unpack_nested_tensor(k, metadata, meta, tensors)
             elif meta.get("list", False):
-                tensor = cls.unpack_list_tensor(k, meta, tensors)
+                tensor = cls.unpack_list_tensor(k, metadata, meta, tensors)
             else:
                 raise ValueError(f"Cannot unpack stored tensor {k} with metadata = {meta}")
             dataset[k] = tensor

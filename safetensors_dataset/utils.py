@@ -3,7 +3,7 @@ from typing import cast
 import torch
 
 
-def _get_torch_dtype_from_str(dtype: str) -> torch.dtype:
+def get_torch_dtype_from_str(dtype: str) -> torch.dtype:
     """
     Convert the string representation of a dtype to the corresponding torch.dtype type
 

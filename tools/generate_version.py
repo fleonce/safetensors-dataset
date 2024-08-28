@@ -2,8 +2,6 @@ import re
 import subprocess
 from pathlib import Path
 
-from with_argparse import with_argparse
-
 UNKNOWN = "Unknown"
 RELEASE_PATTERN = re.compile(r"[0-9]+(\.[0-9]+)*")
 

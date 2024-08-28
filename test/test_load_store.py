@@ -1,4 +1,5 @@
 import os
+import unittest
 from pathlib import Path
 from unittest import TestCase
 
@@ -92,3 +93,14 @@ class StoreDatasetTestCase(TestCase):
         dataset = SafetensorsDataset.from_dict({"values": tensors})
         loaded_dataset = self.store_and_reload_dataset(dataset)
         self.check_datasets_are_equal(dataset.pack(), loaded_dataset)
+
+    @check_dtypes(torch.int, torch.bool)
+    def test_store_sparse_dataset(self, dtype: torch.dtype):
+        tensors = [torch.randint(2, (137, 10, 10), dtype=dtype).to_sparse() for _ in range(10)]
+        dataset = SafetensorsDataset.from_dict({"values": tensors})
+        loaded_dataset = self.store_and_reload_dataset(dataset)
+        self.check_datasets_are_equal(dataset.pack(), loaded_dataset)
+
+
+if __name__ == "__main__":
+    unittest.main()
