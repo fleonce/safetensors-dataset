@@ -40,6 +40,9 @@ class StoreDatasetTestCase(TestCase):
         for key in dataset.keys():
             self.check_tensors_are_equal(dataset[key], comparison[key])
 
+    def format_tensor_not_matching(self, tensor: torch.Tensor, comparison: torch.Tensor):
+        return f"Expected tensors to match: {tensor} vs {comparison}"
+
     def check_tensors_are_equal(self, tensor: torch.Tensor, comparison: torch.Tensor):
         self.assertEqual(isinstance(tensor, list), isinstance(comparison, list))
         if isinstance(tensor, list):
@@ -49,13 +52,18 @@ class StoreDatasetTestCase(TestCase):
             return None
         self.assertEqual(tensor.is_nested, comparison.is_nested)
         self.assertEqual(tensor.is_sparse, comparison.is_sparse)
+        self.assertEqual(tensor.numel(), comparison.numel(), self.format_tensor_not_matching(tensor, comparison))
+        self.assertEqual(tensor.dim(), comparison.dim(), self.format_tensor_not_matching(tensor, comparison))
         if tensor.is_nested:
             self.assertTrue(tensor.values().equal(comparison.values()))
+            self.check_tensors_are_equal(tensor._nested_tensor_size(), comparison._nested_tensor_size())
+            self.check_tensors_are_equal(tensor._nested_tensor_strides(), comparison._nested_tensor_strides())
+            self.check_tensors_are_equal(tensor._nested_tensor_storage_offsets(), comparison._nested_tensor_storage_offsets())
         elif tensor.is_sparse:
             self.assertTrue(tensor.values().equal(comparison.values()))
             self.assertTrue(tensor.indices().equal(comparison.indices()))
         else:
-            self.assertTrue(tensor.equal(comparison))
+            self.assertTrue(tensor.equal(comparison), self.format_tensor_not_matching(tensor, comparison))
 
     @check_dtypes(torch.float, torch.bfloat16, torch.double)
     def test_store_dataset(self, dtype: torch.dtype):
@@ -83,6 +91,10 @@ class StoreDatasetTestCase(TestCase):
         dataset = SafetensorsDataset.from_dict({
             "values": torch.nested.nested_tensor(tensors)
         })
+        print(dataset["values"])
+        print(dataset["values"]._nested_tensor_size())
+        print(dataset["values"]._nested_tensor_strides())
+        print(dataset["values"]._nested_tensor_storage_offsets())
         loaded_dataset = self.store_and_reload_dataset(dataset)
         self.check_datasets_are_equal(dataset, loaded_dataset)
 
@@ -97,6 +109,12 @@ class StoreDatasetTestCase(TestCase):
     @check_dtypes(torch.int, torch.bool)
     def test_store_sparse_dataset(self, dtype: torch.dtype):
         tensors = [torch.randint(2, (137, 10, 10), dtype=dtype).to_sparse() for _ in range(10)]
+        dataset = SafetensorsDataset.from_dict({"values": tensors})
+        loaded_dataset = self.store_and_reload_dataset(dataset)
+        self.check_datasets_are_equal(dataset.pack(), loaded_dataset)
+
+    def test_store_single_elems(self):
+        tensors = list(torch.randint(128, (32,)).unbind())
         dataset = SafetensorsDataset.from_dict({"values": tensors})
         loaded_dataset = self.store_and_reload_dataset(dataset)
         self.check_datasets_are_equal(dataset.pack(), loaded_dataset)

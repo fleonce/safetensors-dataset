@@ -121,12 +121,8 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         if key + ".storage_offsets" in storage:
             storage_offsets = storage[key + ".storage_offsets"]
         else:
-            storage_offsets = sizes * strides
-            storage_offsets = storage_offsets.cumsum(dim=0)
-            storage_shape = storage_offsets.shape
-            storage_zeros = storage_offsets.new_zeros(storage_shape[:-1] + (1,))
-            storage_offsets = torch.cat((storage_zeros, storage_offsets), dim=-1)
-            storage_offsets = storage_offsets[..., :-1]
+            storage_offsets = sizes.cumsum(dim=0).roll(1).squeeze()
+            storage_offsets[0] = 0
         tensor = torch._nested_view_from_buffer(buffer, sizes, strides, storage_offsets)
         return tensor
 
@@ -244,7 +240,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 key + ".buffer": nested_tensor.values(),
                 key + ".sizes": nested_tensor._nested_tensor_size()
             }
-            if nested_tensor.dim() > 2:
+            if nested_tensor.dim() > 2 or nested_tensor._nested_tensor_size().numel() == 0:
                 pack = pack | {
                     key + ".strides": nested_tensor._nested_tensor_strides(),
                     key + ".storage_offsets": nested_tensor._nested_tensor_storage_offsets()
