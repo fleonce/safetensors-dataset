@@ -12,7 +12,7 @@ authors = [
     { name = "Moritz Hennen", email = "mail@fleance.de" }
 ]
 
-keywords = [ "datasets", "saving", "loading", "safetensors" ]
+keywords = [ "datasets", "saving", "loading", "safetensors", "pytorch", "tensors" ]
 classifiers = [
     "Development Status :: 3 - Alpha",
 

@@ -3,16 +3,20 @@ import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional, MutableMapping
 
 import safetensors.torch
-from tqdm import trange
+from tqdm import trange, tqdm
 import torch
 import torch.utils.data
 from typing_extensions import Self
 
 from safetensors_dataset.version import __version__
-from safetensors_dataset.utils import get_torch_dtype_from_str
+from safetensors_dataset.utils import (
+    get_torch_dtype_from_str,
+    TensorLayout,
+    _map_batch_into_dataset, _map_into_dataset,
+)
 
 pack_tensor_t = dict[str, torch.Tensor]
 pack_metadata_t = dict[str, Any] | None
@@ -20,20 +24,39 @@ pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
 can_pack_nested_tensors_fast = hasattr(torch, "_nested_view_from_buffer")
 
 
+def _check_input_dict(m: dict):
+    none_keys = set()
+    empty_keys = set()
+    for k, v in m.items():
+        if v is None:
+            none_keys.add(k)
+        elif isinstance(v, list):
+            if len(v) == 0:
+                empty_keys.add(k)
+
+    assert not none_keys, f"Found {len(none_keys)} keys with 'None' values: {', '.join(none_keys)}"
+    assert not empty_keys, f"Found {len(empty_keys)} keys with empty lists as values: {', '.join(empty_keys)}"
+
+def _get_items_from_tensor(t: torch.Tensor, indices: list[int, ...]):
+    if isinstance(t, list) or t.is_nested or t.is_sparse:
+        return [t[i] for i in indices]
+    return t[indices]
+
+
 class SafetensorsDataset(torch.utils.data.Dataset):
-    dataset: dict[str, list[torch.Tensor] | torch.Tensor]
+    dataset: MutableMapping[str, list[torch.Tensor] | torch.Tensor]
     layout: dict[str, bool]
 
-    def __init__(self, dataset=None):
-        self.dataset = dataset or {}
+    def __init__(self, dataset=None, preprocess=False):
+        self.dataset = _map_into_dataset(dataset or {}) if preprocess else dataset
 
     def filter(
         self,
         filter_fn: Callable[[dict[str, torch.Tensor]], bool],
-        tqdm: bool = True
+        use_tqdm: bool = True
     ):
         filtered_dataset = dict({k: list() for k in self.dataset.keys()})
-        from_to = range if not tqdm else partial(trange, leave=False)
+        from_to = range if not use_tqdm else partial(trange, leave=False)
         for i in from_to(len(self)):
             elem = self[i]
             if filter_fn(elem):
@@ -59,11 +82,84 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return {k: v[item] for k, v in self.dataset.items()}
 
     def __getitems__(self, indices: list[int, ...]):
-        elements_per_key = {k: self._get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
+        elements_per_key = {k: _get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
         return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
     def __len__(self):
         return next((self._get_len_of_item(v) for v in self.dataset.values()), 0)
+
+    def device(self) -> torch.device:
+        if len(self) == 0:
+            raise ValueError("Cannot determine device in empty dataset")
+        return next(iter(self.dataset.values())).device
+
+    def to(self, device: torch.device | str | int) -> "SafetensorsDataset":
+        self_device = self.device
+        if self_device == device:
+            return self
+
+        device_dataset = {key: value.to(device) for key, value in self.dataset.items()}
+        return self.__class__(device_dataset)
+
+    def map(
+        self,
+        func: Callable[[Mapping[str, torch.Tensor]], Mapping[str, torch.Tensor]],
+        info: Optional[Mapping[str, TensorLayout]] = None,
+        use_tqdm: bool = True,
+        batched: bool = False,
+        batch_size: int = 1,
+    ) -> "SafetensorsDataset":
+        info = info or dict()
+        map_dataset: MutableMapping[str, torch.Tensor] = {}
+        items = self._transpose(batched, batch_size)
+        done = 0
+        n_elem = len(self)
+        with tqdm(disable=not use_tqdm, total=len(self)) as progress_bar:
+            for pos, item in enumerate(items):
+                transformed_item = func(item)
+                for key in transformed_item.keys():
+                    if pos > 0 and key not in map_dataset:
+                        raise ValueError(key + " was added after the first item")
+
+                _map_batch_into_dataset(
+                    map_dataset,
+                    transformed_item,
+                    info,
+                    batched
+                )
+                new_done = done + (not batched or batch_size)
+                progress = new_done - done - (new_done % n_elem if new_done > n_elem else 0)
+                progress_bar.update(progress)
+                done += progress
+
+        for key in self.keys():
+            tensor_layout = info.get(key, TensorLayout.STANDARD)
+            if tensor_layout == TensorLayout.VARYING_DIM_SIZE:
+                if not map_dataset[key].is_nested and not map_dataset[key].is_sparse:
+                    warnings.warn(f"{tensor_layout} was specified for {key} but shape is consistent across all elements")
+
+        return self.__class__(map_dataset)
+
+    def _transpose(self, batched=False, batch_size=0):
+        keys = self.keys()
+        if batched:
+            pos = 0
+            for i in range(0, len(self), batch_size):
+                pos += batch_size
+                yield {
+                    key: self.dataset[key][i:i+batch_size]
+                    for key in keys
+                }
+            if pos < len(self):
+                yield {
+                    key: self.dataset[key][pos:]
+                    for key in keys
+                }
+        else:
+            for i in range(len(self)):
+                yield {
+                    key: self.dataset[key][i] for key in keys
+                }
 
     def __repr__(self):
         def nice_shape(shape):
@@ -95,12 +191,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         elif isinstance(i, list):
             return len(i)
         raise ValueError(f"{type(i)} is unknown ({i})")
-
-    @staticmethod
-    def _get_items_from_tensor(t: torch.Tensor, indices: list[int, ...]):
-        if isinstance(t, list) or t.is_nested or t.is_sparse:
-            return [t[i] for i in indices]
-        return t[indices]
 
     @staticmethod
     def unpack_list_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
@@ -303,27 +393,13 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             dataset[k] = tensor
         return SafetensorsDataset(dataset)
 
-    @staticmethod
-    def _check_input_dict(m: dict):
-        none_keys = set()
-        empty_keys = set()
-        for k, v in m.items():
-            if v is None:
-                none_keys.add(k)
-            elif isinstance(v, list):
-                if len(v) == 0:
-                    empty_keys.add(k)
-
-        assert not none_keys, f"Found {len(none_keys)} keys with 'None' values: {', '.join(none_keys)}"
-        assert not empty_keys, f"Found {len(empty_keys)} keys with empty lists as values: {', '.join(empty_keys)}"
+    @classmethod
+    def from_dict(cls, x: dict[str, torch.Tensor | list[torch.Tensor]], preprocess: bool=False):
+        _check_input_dict(x)
+        return SafetensorsDataset(x, preprocess)
 
     @classmethod
-    def from_dict(cls, x: dict[str, torch.Tensor | list[torch.Tensor]]):
-        cls._check_input_dict(x)
-        return SafetensorsDataset(x)
-
-    @classmethod
-    def from_list(cls, x: list[dict[str, torch.Tensor]]):
+    def from_list(cls, x: list[dict[str, torch.Tensor]], preprocess: bool=False):
         out = {}
         for i in x:
             for k, v in i.items():
@@ -331,7 +407,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     out[k] = [v]
                 else:
                     out[k].append(v)
-        return cls.from_dict(out)
+        return cls.from_dict(out, preprocess=preprocess)
 
     @staticmethod
     def _load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
