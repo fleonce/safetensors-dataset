@@ -50,6 +50,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __init__(self, dataset=None, preprocess=False):
         self.dataset = _map_into_dataset(dataset or {}) if preprocess else dataset
 
+    def __contains__(self, item: str):
+        return item in self.dataset
+
     def filter(
         self,
         filter_fn: Callable[[dict[str, torch.Tensor]], bool],
@@ -139,6 +142,24 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     warnings.warn(f"{tensor_layout} was specified for {key} but shape is consistent across all elements")
 
         return self.__class__(map_dataset)
+
+    def select(self, indices: list[int], use_tqdm=True) -> "SafetensorsDataset":
+        select_dataset: MutableMapping[str, torch.Tensor] = {}
+        info = dict()
+        for pos in tqdm(indices, disable=not use_tqdm, total=len(indices)):
+            entry = self[pos]
+
+            _map_batch_into_dataset(select_dataset, entry, info, False)
+        return self.__class__(select_dataset)
+
+    def rename(self, key: str, new_key: str):
+        self.dataset[new_key] = self.dataset[key]
+
+    def __add__(self, other: "SafetensorsDataset"):
+        for key in other.keys():
+            if key in self:
+                raise ValueError(f"Duplicate key {key}")
+            self.dataset[key] = other.dataset[key]
 
     def _transpose(self, batched=False, batch_size=0):
         keys = self.keys()
