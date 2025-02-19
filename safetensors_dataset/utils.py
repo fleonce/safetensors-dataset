@@ -16,6 +16,15 @@ def get_torch_dtype_from_str(dtype: str) -> torch.dtype:
     return cast(torch.dtype, getattr(torch, dtype_name))
 
 
+def slice_tensor(tensor: torch.Tensor, s: slice):
+    if tensor.is_nested:
+        dim = tensor.size(0)
+        stop = min(s.stop if s.stop is not None else dim, dim)
+        step = s.step if s.step is not None else 1
+        return torch.nested.nested_tensor([tensor[pos] for pos in range(s.start, stop, step)])
+    return tensor[s]
+
+
 class TensorLayout(Enum):  # TensorStructure ?
     STANDARD = 1
     SPARSE = 2

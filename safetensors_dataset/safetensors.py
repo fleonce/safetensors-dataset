@@ -15,7 +15,7 @@ from safetensors_dataset.version import __version__
 from safetensors_dataset.utils import (
     get_torch_dtype_from_str,
     TensorLayout,
-    _map_batch_into_dataset, _map_into_dataset,
+    _map_batch_into_dataset, _map_into_dataset, slice_tensor,
 )
 
 pack_tensor_t = dict[str, torch.Tensor]
@@ -112,7 +112,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         batched: bool = False,
         batch_size: int = 1,
     ) -> "SafetensorsDataset":
-        info = info or dict()
+        info = info or self.info()
         map_dataset: MutableMapping[str, torch.Tensor] = {}
         items = self._transpose(batched, batch_size)
         done = 0
@@ -143,14 +143,29 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
         return self.__class__(map_dataset)
 
-    def select(self, indices: list[int], use_tqdm=True) -> "SafetensorsDataset":
+    def select(self, indices: list[int], use_tqdm=False) -> "SafetensorsDataset":
         select_dataset: MutableMapping[str, torch.Tensor] = {}
-        info = dict()
+        info = self.info()
         for pos in tqdm(indices, disable=not use_tqdm, total=len(indices)):
-            entry = self[pos]
+            entry = {k: v.clone() for k, v in self[pos].items()}
 
             _map_batch_into_dataset(select_dataset, entry, info, False)
         return self.__class__(select_dataset)
+
+    def info(self) -> Mapping[str, TensorLayout]:
+        def tensor_layout_for_key(k: str):
+            if isinstance(self.dataset[k], list):
+                shapes = set(map(lambda x: x.shape, self.dataset[k]))
+                if len(shapes) > 1:
+                    return TensorLayout.VARYING_DIM_SIZE
+                return TensorLayout.STANDARD
+            if self.dataset[k].is_nested or self.dataset[k].is_sparse:
+                return TensorLayout.VARYING_DIM_SIZE
+            return TensorLayout.STANDARD
+        return {
+            key: tensor_layout_for_key(key)
+            for key in self.keys()
+        }
 
     def rename(self, key: str, new_key: str):
         self.dataset[new_key] = self.dataset[key]
@@ -168,12 +183,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             for i in range(0, len(self), batch_size):
                 pos += batch_size
                 yield {
-                    key: self.dataset[key][i:i+batch_size]
+                    key: slice_tensor(self.dataset[key], slice(i, i+batch_size, None))
                     for key in keys
                 }
             if pos < len(self):
                 yield {
-                    key: self.dataset[key][pos:]
+                    key: slice_tensor(self.dataset[key], slice(pos, None, None))
                     for key in keys
                 }
         else:
@@ -291,6 +306,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 key + ".buffer": buffer,
                 key + ".sizes": tensor._nested_tensor_size()
             }
+            if tensor.dim() > 2:
+                pack[key + ".strides"] = tensor._nested_tensor_strides()
+                pack[key + ".storage_offsets"] = tensor._nested_tensor_storage_offsets()
             metadata = {
                 "nested": True,
                 "dtype": repr(tensor.dtype),
