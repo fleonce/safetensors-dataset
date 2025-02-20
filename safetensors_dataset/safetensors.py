@@ -91,6 +91,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __len__(self):
         return next((self._get_len_of_item(v) for v in self.dataset.values()), 0)
 
+    @property
     def device(self) -> torch.device:
         if len(self) == 0:
             raise ValueError("Cannot determine device in empty dataset")
