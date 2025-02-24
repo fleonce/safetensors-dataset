@@ -43,10 +43,37 @@ class SafetensorsDict(dict[STK, SafetensorsDataset]):
             for name, dataset in self.items()
         })
 
-    def select(self, indices: dict[str, list[int]] | list[int], use_tqdm: bool = False):
-        pass
+    def filter(
+        self,
+        func: Callable[[dict[str, torch.Tensor]], bool],
+        *,
+        use_tqdm: bool = True,
+        batched: bool = False,
+        batch_size: int = 1,
+    ) -> "SafetensorsDict":
+        if batched is True:
+            raise NotImplementedError(f"{batched=}")
 
-    def rename(self, key: str, new_key: str): ...
+        return SafetensorsDict({
+            name: dataset.filter(
+                func,
+                tqdm=use_tqdm,
+            )
+            for name, dataset in self.items()
+        })
+
+    def select(self, indices: dict[str, list[int]] | list[int], use_tqdm: bool = False):
+        return SafetensorsDict({
+            name: dataset.select(
+                indices.get(name) if isinstance(indices, dict) else indices,
+                use_tqdm=use_tqdm
+            )
+            for name, dataset in self.items()
+        })
+
+    def rename(self, key: str, new_key: str):
+        for dataset in self.values():
+            dataset.rename(key, new_key)
 
     def info(self) -> Mapping[str, TensorLayout]: ...
 
@@ -60,7 +87,7 @@ class SafetensorsDict(dict[STK, SafetensorsDataset]):
         else:
             index_path = index_path / "index.json"
         index_dict = {
-            name: index_path.parent / (str(name) + ".safetensors")  # path.with_stem(path.stem + "_" + name)
+            name: index_path.parent / (str(name) + ".safetensors")
             for name, dataset in self.items()
         }
         if not index_path.parent.exists():
@@ -71,9 +98,5 @@ class SafetensorsDict(dict[STK, SafetensorsDataset]):
 
         with open(index_path, "w") as f:
             json.dump([{"split": key, "file": value.name} for key, value in index_dict.items()], f, indent=2)
-
-
-    @classmethod
-    def load_from_file(cls, path: Path) -> typing_extensions.Self: ...
 
 
