@@ -38,6 +38,20 @@ class StoreDatasetTestCase(TestCase):
         for name, dataset in ds.items():
             self.check_datasets_are_equal(dataset, loaded[name])
 
+    def test_store_int_dict(self):
+        ds = SafetensorsDict(
+            {
+                0: SafetensorsDataset({"label": torch.arange(10)}),
+                1: SafetensorsDataset({"label": torch.arange(10) + 10}),
+            }
+        )
+
+        ds.save_to_file("ints")
+
+        loaded = load_safetensors("ints")
+        for name, dataset in ds.items():
+            self.check_datasets_are_equal(dataset, loaded[name])
+
     @staticmethod
     def store_and_reload_dataset(dataset: SafetensorsDataset):
         save_path = Path.cwd() / "dataset.safetensors"

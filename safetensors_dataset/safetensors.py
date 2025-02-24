@@ -3,7 +3,7 @@ import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, MutableMapping
+from typing import Any, Callable, Mapping, Optional, MutableMapping, Union
 
 import safetensors.torch
 from tqdm import trange, tqdm
@@ -381,7 +381,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             metadata = {"nested": True, "numel": len(tensors)}
             return pack, metadata
 
-    def save_to_file(self, path: Path):
+    def save_to_file(self, path: Union[str, Path]):
         def check_key(key: str):
             if "." in key:
                 raise ValueError(f". is not allowed in a safetensors dataset (used in {key})")

@@ -1,7 +1,7 @@
 import json
 import typing_extensions
 from pathlib import Path
-from typing import Callable, Optional, Mapping, Union
+from typing import Callable, Optional, Mapping, Union, TypeAlias
 
 import torch
 from more_itertools.more import first
@@ -9,9 +9,10 @@ from more_itertools.more import first
 from .safetensors import SafetensorsDataset
 from .utils import TensorLayout
 
+STK: TypeAlias = Union[str, int]
 
-class SafetensorsDict(dict[str, SafetensorsDataset]):
-    def __getitem__(self, item: str) -> SafetensorsDataset:
+class SafetensorsDict(dict[STK, SafetensorsDataset]):
+    def __getitem__(self, item: STK) -> SafetensorsDataset:
         return super().__getitem__(item)
 
     @property
@@ -54,18 +55,22 @@ class SafetensorsDict(dict[str, SafetensorsDataset]):
             path = Path(path)
 
         index_path = path
-        if index_path.suffixes != [".safetensors", ".index", ".json"]:
-            index_path = index_path.with_suffix(".safetensors.index.json")
+        if index_path.suffix == ".safetensors":
+            index_path = index_path.parent / index_path.stem / "index.json"
+        else:
+            index_path = index_path / "index.json"
         index_dict = {
-            name: path.with_stem(path.stem + "_" + name)
+            name: index_path.parent / (str(name) + ".safetensors")  # path.with_stem(path.stem + "_" + name)
             for name, dataset in self.items()
         }
+        if not index_path.parent.exists():
+            index_path.parent.mkdir(parents=True, exist_ok=True)
         for name, dataset in self.items():
-            dataset_path = index_dict.get(name)
+            dataset_path = index_dict[name]
             dataset.save_to_file(dataset_path)
 
         with open(index_path, "w") as f:
-            json.dump({key: value.name for key, value in index_dict.items()}, f, indent=2)
+            json.dump([{"split": key, "file": value.name} for key, value in index_dict.items()], f, indent=2)
 
 
     @classmethod

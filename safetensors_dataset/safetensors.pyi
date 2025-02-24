@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, overload, Self, Mapping, Any, Optional, Generator
+from typing import Callable, overload, Self, Mapping, Any, Optional, Generator, Union
 
 import torch.utils.data
 from torch import Tensor
@@ -58,7 +58,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
     def info(self) -> Mapping[str, TensorLayout]: ...
 
-    def save_to_file(self, path: Path): ...
+    def save_to_file(self, path: Union[str, Path]): ...
 
     @classmethod
     def load_from_file(cls, path: Path) -> SafetensorsDataset: ...
