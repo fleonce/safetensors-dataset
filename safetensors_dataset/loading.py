@@ -6,11 +6,13 @@ from .safetensors import SafetensorsDataset
 from .safetensors_dict import SafetensorsDict
 
 
-def load_safetensors(path: pathlib.Path) -> Union[SafetensorsDataset, SafetensorsDict]:
-    if path.suffix == ".index":
+def load_safetensors(path: Union[str, pathlib.Path]) -> Union[SafetensorsDataset, SafetensorsDict]:
+    if isinstance(path, str):
+        path = pathlib.Path(path)
+    if path.suffixes == [".safetensors", ".index", ".json"]:
         index_path = path
-    elif path.with_suffix(".safetensors.index").exists():
-        index_path = path.with_suffix(".safetensors.index")
+    elif path.with_suffix(".safetensors.index.json").exists():
+        index_path = path.with_suffix(".safetensors.index.json")
     else:
         return SafetensorsDataset.load_from_file(path)
 

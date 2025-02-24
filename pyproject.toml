@@ -5,7 +5,7 @@ license = {text = "Apache 2.0"}
 readme = "README.md"
 dynamic = ["version"]
 
-dependencies = ["safetensors", "torch", "tqdm"]
+dependencies = ["safetensors", "torch", "tqdm", "more_itertools==10.6.0"]
 requires-python = ">= 3.8"
 
 authors = [

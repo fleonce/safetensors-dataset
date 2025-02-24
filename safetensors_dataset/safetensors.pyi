@@ -13,7 +13,7 @@ pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
 class SafetensorsDataset(torch.utils.data.Dataset):
     dataset: dict[str, list[torch.Tensor] | torch.Tensor]
 
-    def __init__(self, dataset=None, preprocess: bool=False):
+    def __init__(self, dataset: dict[str, list[torch.Tensor] | torch.Tensor]=None, preprocess: bool=False):
         pass
 
     def __contains__(self, item: str):

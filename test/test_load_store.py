@@ -5,7 +5,7 @@ from unittest import TestCase
 
 import torch
 
-from safetensors_dataset import SafetensorsDataset
+from safetensors_dataset import SafetensorsDataset, SafetensorsDict, load_safetensors
 
 
 def try_delete_file(path: Path):
@@ -24,12 +24,26 @@ def check_dtypes(*dtypes: torch.dtype):
 
 class StoreDatasetTestCase(TestCase):
 
+    def test_store_dict(self):
+        ds = SafetensorsDict(
+            {
+                "train": SafetensorsDataset({"label": torch.arange(10)}),
+                "test": SafetensorsDataset({"label": torch.arange(10) + 10}),
+            }
+        )
+
+        ds.save_to_file("test.safetensors")
+
+        loaded = load_safetensors("test.safetensors")
+        for name, dataset in ds.items():
+            self.check_datasets_are_equal(dataset, loaded[name])
+
     @staticmethod
     def store_and_reload_dataset(dataset: SafetensorsDataset):
         save_path = Path.cwd() / "dataset.safetensors"
         try:
             dataset.save_to_file(save_path)
-            dataset = dataset.load_from_file(save_path)
+            dataset = load_safetensors(save_path)
         finally:
             try_delete_file(save_path)
         return dataset
