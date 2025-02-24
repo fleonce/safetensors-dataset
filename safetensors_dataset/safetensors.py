@@ -67,6 +67,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     filtered_dataset[k].append(elem[k])
         return SafetensorsDataset(filtered_dataset)
 
+    def shard(self):
+        raise NotImplementedError
+
     def pack(self) -> Self:
         for key in self.keys():
             if isinstance(self[key], list):
