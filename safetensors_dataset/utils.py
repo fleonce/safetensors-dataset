@@ -27,7 +27,6 @@ def slice_tensor(tensor: torch.Tensor, s: slice):
 
 class TensorLayout(Enum):  # TensorStructure ?
     STANDARD = 1
-    SPARSE = 2
     VARYING_DIM_SIZE = 3
 
 
@@ -36,7 +35,7 @@ def try_size(t: torch.Tensor, dim: int):
         return t.size(dim)
     except RuntimeError:
         pass
-    return "s0"
+    return f"s{dim}"
 
 
 def nt_size(t: torch.Tensor):
@@ -94,9 +93,10 @@ def _map_batch_into_dataset(
     result: Mapping[str, torch.Tensor],
     info: Mapping[str, TensorLayout],
     batched: bool
-):
+) -> Mapping[str, TensorLayout]:
+    known_layouts = dict(info)
     for key, value in result.items():
-        tensor_layout = info.get(key, TensorLayout.STANDARD)
+        tensor_layout = known_layouts.get(key, TensorLayout.STANDARD)
         dataset_value = dataset.get(key, None)
         if dataset_value is None:
             if tensor_layout in {TensorLayout.STANDARD, TensorLayout.VARYING_DIM_SIZE}:
@@ -105,7 +105,7 @@ def _map_batch_into_dataset(
                 if value.is_sparse and not value.is_coalesced():
                     value = value.coalesce()
                 dataset[key] = value
-            elif tensor_layout is TensorLayout.SPARSE:
+            else:
                 raise NotImplementedError(tensor_layout)  # not needed!
         else:
             if tensor_layout == TensorLayout.STANDARD:
