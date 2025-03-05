@@ -62,6 +62,9 @@ def _map_into_dataset(
                 dims = set(map(lambda t: t.dim(), value))
                 if not len(dims) == 1:
                     raise ValueError(f"{key}: mismatching dimensions: {dims}")
+                batch_sizes = set(map(lambda t: t.size(0), value))
+                if batch_sizes != {1}:
+                    value = [elem.unsqueeze(0) for elem in value]
 
                 indices, values = list(), list()
                 for pos, tensor in enumerate(value):
