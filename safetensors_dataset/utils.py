@@ -79,6 +79,15 @@ def _map_into_dataset(
                 indices = torch.cat(indices, dim=1)
                 values = torch.cat(values, dim=0)
 
+                if indices.numel() == 0:
+                    max_sizes = tuple()
+                    for dim in range(value[0].dim()):
+                        max_sizes = max_sizes + (max(elem.size(dim) for elem in value),)
+                    max_sizes = (len(value),) + max_sizes[1:]
+                    value = torch.sparse_coo_tensor(indices, values, size=max_sizes)
+                    map_dataset[key] = value
+                    continue
+
                 value = torch.sparse_coo_tensor(
                     indices,
                     values,
