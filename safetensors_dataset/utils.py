@@ -65,8 +65,10 @@ def _map_into_dataset(
                 batch_sizes = set(map(lambda t: t.size(0), value))
                 if batch_sizes != {1}:
                     value = [elem.unsqueeze(0) for elem in value]
+                batch_size = len(value)
 
                 indices, values = list(), list()
+                a = set()
                 for pos, tensor in enumerate(value):
                     if not isinstance(tensor, torch.Tensor):
                         raise ValueError(f"Element {pos} in {key} is not a Tensor but a {type(tensor)}")
@@ -74,6 +76,8 @@ def _map_into_dataset(
                         tensor = tensor.coalesce()
                     tensor_indices = tensor.indices()
                     tensor_indices[0] += pos
+                    if tensor_indices.numel() > 0:
+                        a.add(tensor_indices[0].unique().item())
                     indices.append(tensor_indices)
                     values.append(tensor.values())
                 indices = torch.cat(indices, dim=1)
@@ -88,13 +92,16 @@ def _map_into_dataset(
                     map_dataset[key] = value
                     continue
 
-                value = torch.sparse_coo_tensor(
+                new_value = torch.sparse_coo_tensor(
                     indices,
                     values,
-                    indices.amax(dim=1).add(1).unbind(dim=0),
+                    (batch_size,) + indices.amax(dim=1).add(1).unbind(dim=0)[1:],
                     is_coalesced=True
                 )
-                map_dataset[key] = value
+
+                if new_value.size(0) != len(value):
+                    raise ValueError(key, new_value.shape, len(value))
+                map_dataset[key] = new_value
         else:
             map_dataset[key] = value
     return map_dataset
