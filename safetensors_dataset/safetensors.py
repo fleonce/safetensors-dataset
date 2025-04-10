@@ -174,7 +174,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def rename(self, key: str, new_key: str):
         self.dataset[new_key] = self.dataset[key]
 
-    def __add__(self, other: "SafetensorsDataset"):
+    def __add__(self, other: "SafetensorsDataset") -> "SafetensorsDataset":
+        elements = dict(self.dataset)
+        for key in other.keys():
+            if key in elements:
+                raise ValueError(f"Duplicate key {key}")
+            elements[key] = other[key]
+        return SafetensorsDataset(elements)
+
+    def __iadd__(self, other: "SafetensorsDataset"):
         for key in other.keys():
             if key in self:
                 raise ValueError(f"Duplicate key {key}")

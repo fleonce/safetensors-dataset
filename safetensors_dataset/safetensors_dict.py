@@ -1,4 +1,6 @@
 import json
+import operator
+
 import typing_extensions
 from pathlib import Path
 from typing import Callable, Optional, Mapping, Union, TypeAlias
@@ -70,6 +72,16 @@ class SafetensorsDict(dict[STK, SafetensorsDataset]):
             )
             for name, dataset in self.items()
         })
+
+    def __add__(self, other: "SafetensorsDict") -> "SafetensorsDict":
+        return SafetensorsDict({
+            key: value + other[key]
+            for key, value in self.items()
+        })
+
+    def __iadd__(self, other: "SafetensorsDict"):
+        for key, value in self.items():
+            operator.iadd(value, other)
 
     def rename(self, key: str, new_key: str):
         for dataset in self.values():
