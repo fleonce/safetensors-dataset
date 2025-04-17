@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, MutableMapping, Union
 
 import safetensors.torch
-from more_itertools.recipes import flatten
+from more_itertools.recipes import grouper
 from tqdm import trange, tqdm
 import torch
 import torch.utils.data
@@ -17,7 +17,7 @@ from safetensors_dataset.version import __version__
 from safetensors_dataset.utils import (
     get_torch_dtype_from_str,
     TensorLayout,
-    _map_batch_into_dataset, _map_into_dataset, slice_tensor,
+    _map_batch_into_dataset, _map_into_dataset, slice_tensor, _load_safetensors_metadata,
 )
 
 pack_tensor_t = dict[str, torch.Tensor]
@@ -58,6 +58,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def shard(
         self,
         chunk_size: int = 5000,
+        preprocess_if_unprocessed: bool = True,
     ) -> "ShardedSafetensorsDataset | SafetensorsDataset":
         if len(self) <= chunk_size:
             raise ValueError(f"Dataset size is smaller than chunk size ({len(self)} < {chunk_size})")
@@ -71,14 +72,28 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         num_chunks, remainder = divmod(length, chunk_size)
         num_chunks = num_chunks + (remainder != 0)
 
-        chunk_datasets: tuple[dict[str, torch.Tensor], ...] = tuple(
-            dict()
-            for _ in range(num_chunks)
-        )
         if not is_preprocessed:
-            raise NotImplementedError("easy case, just iterate over lists")
+            unprocessed_chunk_datasets: tuple[dict[str, list[torch.Tensor]], ...] = tuple(
+                dict()
+                for _ in range(num_chunks)
+            )
+            for key, list_of_tensors in self.dataset.items():
+                chunks_of_lists = grouper(list_of_tensors, n=chunk_size, incomplete='ignore')
+                for pos, chunk in enumerate(chunks_of_lists):
+                    unprocessed_chunk_datasets[pos][key] = chunk
+            return ShardedSafetensorsDataset(tuple(
+                SafetensorsDataset(unprocessed_chunk, preprocess=preprocess_if_unprocessed)
+                for unprocessed_chunk in unprocessed_chunk_datasets
+            ))
         else:
-            for key, tensor in self.dataset.items():
+            chunk_datasets: tuple[dict[str, torch.Tensor], ...] = tuple(
+                dict()
+                for _ in range(num_chunks)
+            )
+
+            keys = set(self.dataset.keys())
+            for key in keys:
+                tensor = self.dataset.pop(key)
                 if not isinstance(tensor, torch.Tensor):
                     raise ValueError(f"tensor must be torch.Tensor, but got {type(tensor)}")
                 is_nested = tensor.is_nested
@@ -163,6 +178,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                         del tensor
                         del indices
                         del values
+                        gc.collect()
                     else:
                         raise NotImplementedError(tensor.layout)
                 else:
@@ -170,10 +186,10 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
                 for pos in range(num_chunks):
                     chunk_datasets[pos][key] = chunks[pos]
-        return ShardedSafetensorsDataset(tuple(
-            SafetensorsDataset(chunk)
-            for chunk in chunk_datasets
-        ))
+            return ShardedSafetensorsDataset(tuple(
+                SafetensorsDataset(chunk)
+                for chunk in chunk_datasets
+            ))
 
     def filter(
         self,
@@ -351,6 +367,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
         return f"SafetensorsDataset(size={size}, shapes={shapes})"
 
+    def __del__(self):
+        del self.dataset
+
     @staticmethod
     def _get_len_of_item(i):
         if isinstance(i, torch.Tensor):
@@ -508,7 +527,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             metadata = {"nested": True, "numel": len(tensors)}
             return pack, metadata
 
-    def save_to_file(self, path: Union[str, Path]):
+    def _save_to_dict(self):
         def check_key(key: str):
             if "." in key:
                 raise ValueError(f". is not allowed in a safetensors dataset (used in {key})")
@@ -530,12 +549,14 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     metadata[k] = pack_metadata
 
         metadata = {k: json.dumps(v) for k, v in metadata.items()}
+        return tensors, metadata
+
+    def save_to_file(self, path: Union[str, Path]):
+        tensors, metadata = self._save_to_dict()
         safetensors.torch.save_file(tensors, path, metadata=metadata)
 
     @classmethod
-    def load_from_file(cls, path: Path):
-        metadata = cls._load_safetensors_metadata(path)  # {"size": len}
-        tensors = safetensors.torch.load_file(path, device="cpu")
+    def _load_from_dict(cls, tensors: dict[str, torch.Tensor], metadata: dict[str, Any]):
         dataset = {}
         keys = set()
         for k in tensors.keys():
@@ -556,12 +577,18 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 tensor = cls.unpack_sparse_tensor(k, metadata, meta, tensors)
             elif meta.get("nested", False) is True:
                 tensor = cls.unpack_nested_tensor(k, metadata, meta, tensors)
-            elif meta.get("list", False):
+            elif meta.get("list", False) is True:
                 tensor = cls.unpack_list_tensor(k, metadata, meta, tensors)
             else:
                 raise ValueError(f"Cannot unpack stored tensor {k} with metadata = {meta}")
             dataset[k] = tensor
         return SafetensorsDataset(dataset)
+
+    @classmethod
+    def load_from_file(cls, path: Path):
+        metadata = _load_safetensors_metadata(path)
+        tensors = safetensors.torch.load_file(path, device="cpu")
+        return cls._load_from_dict(tensors, metadata)
 
     @classmethod
     def from_dict(cls, x: dict[str, torch.Tensor | list[torch.Tensor]], preprocess: bool=False):
@@ -578,17 +605,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 else:
                     out[k].append(v)
         return cls.from_dict(out, preprocess=preprocess)
-
-    @staticmethod
-    def _load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
-        with open(fp, 'rb') as f:
-            n_bytes = f.read(8)
-            n_bytes = int.from_bytes(n_bytes, byteorder='little', signed=False)
-            content = f.read(n_bytes)
-            content = content.decode("utf-8")
-            metadata = json.loads(content)['__metadata__']
-            metadata = {k: json.loads(v) for k, v in metadata.items()}
-            return metadata
 
 class ShardedSafetensorsDataset(torch.utils.data.Dataset):
     shards: tuple[SafetensorsDataset, ...]
@@ -615,7 +631,7 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
         item %= self.shard_size
         return {k: v[item] for k, v in dataset_shard.items()}
 
-    def shard(self, pos: Optional[int] = None) -> SafetensorsDataset:
+    def get_shard(self, pos: Optional[int] = None) -> SafetensorsDataset:
         if pos is None:
             raise NotImplementedError("Cannot shard() a sharded dataset")
         return self.shards[pos]
@@ -630,9 +646,52 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
 
         bucket_items: MutableMapping[int, list[dict[str, torch.Tensor]]] = dict()
         for bucket, bucket_indices in buckets.items():
-            bucket_items[bucket] = self.shard(bucket).__getitems__(bucket_indices)
+            bucket_items[bucket] = self.get_shard(bucket).__getitems__(bucket_indices)
 
         return [
             bucket_items[index // self.shard_size][buckets[index // self.shard_size].index(index % self.shard_size)]
             for index in indices
         ]
+
+    def save_to_file(self, path: Union[str, Path]):
+        tensors: OrderedDict[str, torch.Tensor] = OrderedDict()
+        metadata: dict[str, Any] = {"num_shards": str(len(self.shards))}
+        for pos, shard in enumerate(self.shards):
+            shard_tensors, shard_metadata = shard._save_to_dict()
+
+            for key, tensor in shard_tensors.items():
+                tensors[f"shards.{pos}.{key}"] = tensor
+
+            for key, value in shard_metadata.items():
+                metadata[f"shards.{pos}.{key}"] = value
+        safetensors.torch.save_file(tensors, path, metadata=metadata)
+
+    @classmethod
+    def _load_from_dict(cls, tensors, metadata):
+        if "num_shards" not in metadata:
+            raise ValueError("num_shards")
+        num_shards = int(metadata["num_shards"])
+
+        shard_datasets = tuple()
+        for pos in range(num_shards):
+            shard_tensors = {
+                key.split(".", 2)[2]: value
+                for key, value in tensors.items()
+                if key.startswith("shards.")
+            }
+
+            shard_metadata = {
+                key.split(".", 2)[2]: value
+                for key, value in metadata.items()
+                if key.startswith("shards.")
+            }
+
+            shard_dataset = SafetensorsDataset._load_from_dict(shard_tensors, shard_metadata)
+            shard_datasets = shard_datasets + (shard_dataset,)
+        return ShardedSafetensorsDataset(shard_datasets)
+
+    @classmethod
+    def load_from_file(cls, path: Union[str, Path]):
+        metadata = _load_safetensors_metadata(path)
+        tensors = safetensors.torch.load_file(path, device="cpu")
+        return cls._load_from_dict(tensors, metadata)

@@ -1,5 +1,7 @@
+import json
 from enum import Enum
-from typing import cast, MutableMapping, Mapping, Literal
+from pathlib import Path
+from typing import cast, MutableMapping, Mapping, Literal, Any
 
 import torch
 
@@ -40,6 +42,18 @@ def try_size(t: torch.Tensor, dim: int):
 
 def nt_size(t: torch.Tensor):
     return tuple(try_size(t, i) for i in range(t.dim()))
+
+
+def _load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
+    with open(fp, 'rb') as f:
+        n_bytes = f.read(8)
+        n_bytes = int.from_bytes(n_bytes, byteorder='little', signed=False)
+        content = f.read(n_bytes)
+        content = content.decode("utf-8")
+        metadata = json.loads(content)['__metadata__']
+        metadata = {k: json.loads(v) for k, v in metadata.items()}
+        return metadata
+
 
 def _map_into_dataset(
     dataset: Mapping[str, torch.Tensor | list[torch.Tensor]],
