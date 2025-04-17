@@ -1,3 +1,4 @@
+import gc
 import json
 import warnings
 from collections import OrderedDict
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, MutableMapping, Union
 
 import safetensors.torch
+from more_itertools.recipes import flatten
 from tqdm import trange, tqdm
 import torch
 import torch.utils.data
@@ -37,7 +39,7 @@ def _check_input_dict(m: dict):
     assert not none_keys, f"Found {len(none_keys)} keys with 'None' values: {', '.join(none_keys)}"
     assert not empty_keys, f"Found {len(empty_keys)} keys with empty lists as values: {', '.join(empty_keys)}"
 
-def _get_items_from_tensor(t: torch.Tensor, indices: list[int, ...]):
+def _get_items_from_tensor(t: torch.Tensor, indices: list[int]):
     if isinstance(t, list) or t.is_nested or t.is_sparse:
         return [t[i] for i in indices]
     return t[indices]
@@ -53,6 +55,126 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __contains__(self, item: str):
         return item in self.dataset
 
+    def shard(
+        self,
+        chunk_size: int = 5000,
+    ) -> "ShardedSafetensorsDataset | SafetensorsDataset":
+        if len(self) <= chunk_size:
+            raise ValueError(f"Dataset size is smaller than chunk size ({len(self)} < {chunk_size})")
+
+        is_preprocessed = all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in self.dataset.values()
+        )
+
+        length = len(self)
+        num_chunks, remainder = divmod(length, chunk_size)
+        num_chunks = num_chunks + (remainder != 0)
+
+        chunk_datasets: tuple[dict[str, torch.Tensor], ...] = tuple(
+            dict()
+            for _ in range(num_chunks)
+        )
+        if not is_preprocessed:
+            raise NotImplementedError("easy case, just iterate over lists")
+        else:
+            for key, tensor in self.dataset.items():
+                if not isinstance(tensor, torch.Tensor):
+                    raise ValueError(f"tensor must be torch.Tensor, but got {type(tensor)}")
+                is_nested = tensor.is_nested
+                is_sparse = tensor.is_sparse
+
+                if not is_nested and not is_sparse:
+                    # medium easy path, just slice/chunk the tensor
+                    chunks = torch.tensor_split(tensor, num_chunks, dim=0)
+                    # clone here, so that we can delete the original tensor
+                    chunks = tuple(chunk.clone() for chunk in chunks)
+                    del tensor  # release memory
+                    gc.collect()
+                elif is_nested and not is_sparse:
+                    if type(tensor) is torch.Tensor:
+                        sizes = tensor._nested_tensor_size()
+                        storage_offsets = tensor._nested_tensor_storage_offsets()
+                        strides = tensor._nested_tensor_strides()
+
+                        size_chunks = torch.split(sizes, chunk_size, dim=0)
+                        stride_chunks = torch.split(strides, chunk_size, dim=0)
+                        storage_offset_chunks = torch.split(storage_offsets, chunk_size, dim=0)
+                        values = tensor.values()
+                        chunk_value_views = tuple(
+                            values[storage_offset_chunks[pos].view(-1)[0]:(storage_offset_chunks[pos + 1].view(-1)[0] if pos + 1 != num_chunks else None)].clone()
+                            for pos in range(num_chunks)
+                        )
+                        del values
+                        gc.collect()
+
+                        # size_chunks =
+                        chunks = tuple(
+                            torch._nested_view_from_buffer(
+                                chunk_value_views[pos],
+                                size_chunk.clone(),
+                                stride_chunk.clone(),
+                                storage_offset_chunk.clone() - storage_offset_chunk.view(-1)[0]
+                            )
+                            for pos, (size_chunk, stride_chunk, storage_offset_chunk)
+                            in enumerate(zip(size_chunks, stride_chunks, storage_offset_chunks))
+                        )
+                    else:
+                        raise NotImplementedError("nested", type(tensor))
+                elif is_sparse and not is_nested:
+                    indices = tensor.indices()
+                    values = tensor.values()
+                    if indices.numel() == 0:
+                        if tensor.layout == torch.sparse_coo:
+                            chunks = tuple(
+                                torch.sparse_coo_tensor(
+                                    indices,
+                                    values,
+                                    size=(chunk_size if pos + 1 != num_chunks else remainder,) + tensor.shape[1:],
+                                    check_invariants=False,
+                                    is_coalesced=tensor.is_coalesced()
+                                )
+                                for pos in range(num_chunks)
+                            )
+                        else:
+                            raise NotImplementedError(tensor.layout)
+                    elif tensor.layout == torch.sparse_coo:
+                        chunks = tuple()
+                        indices_dim0 = indices[0]
+                        for pos in range(num_chunks):
+                            chunk_start = pos * chunk_size
+                            chunk_end = (pos + 1) * chunk_size
+                            chunk_mask = (indices_dim0 >= chunk_start) & (indices_dim0 < chunk_end)
+                            chunk_indices_dim0 = indices_dim0[chunk_mask]
+                            chunk_values = values[chunk_mask]
+                            assert chunk_values.numel() == chunk_indices_dim0.numel()
+                            if chunk_indices_dim0.numel() == 0:
+                                raise NotImplementedError
+
+                            chunk_indices = indices[:, chunk_mask]
+                            chunk_indices[0] -= chunk_indices_dim0[0]
+                            chunks = chunks + (torch.sparse_coo_tensor(
+                                chunk_indices.clone(),
+                                chunk_values.clone(),
+                                (chunk_size if pos + 1 != num_chunks else remainder,) + tensor.shape[1:],
+                                    check_invariants=False,
+                                is_coalesced=tensor.is_coalesced()
+                            ),)
+                        del tensor
+                        del indices
+                        del values
+                    else:
+                        raise NotImplementedError(tensor.layout)
+                else:
+                    raise ValueError(f"Tensor cannot be nested and sparse")
+
+                for pos in range(num_chunks):
+                    chunk_datasets[pos][key] = chunks[pos]
+        return ShardedSafetensorsDataset(tuple(
+            SafetensorsDataset(chunk)
+            for chunk in chunk_datasets
+        ))
+
     def filter(
         self,
         filter_fn: Callable[[dict[str, torch.Tensor]], bool],
@@ -66,9 +188,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 for k in filtered_dataset.keys():
                     filtered_dataset[k].append(elem[k])
         return SafetensorsDataset(filtered_dataset)
-
-    def shard(self):
-        raise NotImplementedError
 
     def pack(self) -> Self:
         for key in self.keys():
@@ -87,7 +206,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             return self.dataset[item]
         return {k: v[item] for k, v in self.dataset.items()}
 
-    def __getitems__(self, indices: list[int, ...]):
+    def __getitems__(self, indices: list[int]):
         elements_per_key = {k: _get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
         return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
@@ -470,3 +589,50 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             metadata = json.loads(content)['__metadata__']
             metadata = {k: json.loads(v) for k, v in metadata.items()}
             return metadata
+
+class ShardedSafetensorsDataset(torch.utils.data.Dataset):
+    shards: tuple[SafetensorsDataset, ...]
+
+    def __init__(self, shards: tuple[SafetensorsDataset, ...]):
+        self.shards: tuple[SafetensorsDataset, ...] = shards
+        self.shard_size = len(shards[0])
+
+    def __contains__(self, item):
+        return item in self.shards[0]
+
+    def __len__(self):
+        return (len(self.shards) - 1) * self.shard_size + (len(self.shards[-1]) if len(self.shards) > 1 else 0)
+
+    def __getitem__(self, item: int | str) -> dict[str, torch.Tensor] | torch.Tensor:
+        if isinstance(item, str):
+            raise NotImplementedError(f"Cannot access keys for sharded datasets")
+        if item < 0:
+            item = len(self) - abs(item)
+        shard = item // self.shard_size
+        if shard >= len(self.shards) or item >= len(self):
+            raise IndexError(item)
+        dataset_shard = self.shards[shard].dataset
+        item %= self.shard_size
+        return {k: v[item] for k, v in dataset_shard.items()}
+
+    def shard(self, pos: Optional[int] = None) -> SafetensorsDataset:
+        if pos is None:
+            raise NotImplementedError("Cannot shard() a sharded dataset")
+        return self.shards[pos]
+
+    def __getitems__(self, indices: list[int]):
+        buckets: MutableMapping[int, list[int]] = dict()
+        for index in indices:
+            bucket = index // self.shard_size
+            if bucket not in buckets:
+                buckets[bucket] = list()
+            buckets[bucket].append(index % self.shard_size)
+
+        bucket_items: MutableMapping[int, list[dict[str, torch.Tensor]]] = dict()
+        for bucket, bucket_indices in buckets.items():
+            bucket_items[bucket] = self.shard(bucket).__getitems__(bucket_indices)
+
+        return [
+            bucket_items[index // self.shard_size][buckets[index // self.shard_size].index(index % self.shard_size)]
+            for index in indices
+        ]
