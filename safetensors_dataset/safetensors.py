@@ -73,6 +73,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         num_chunks = num_chunks + (remainder != 0)
 
         if not is_preprocessed:
+            raise NotImplementedError
             unprocessed_chunk_datasets: tuple[dict[str, list[torch.Tensor]], ...] = tuple(
                 dict()
                 for _ in range(num_chunks)
@@ -101,7 +102,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
                 if not is_nested and not is_sparse:
                     # medium easy path, just slice/chunk the tensor
-                    chunks = torch.tensor_split(tensor, num_chunks, dim=0)
+                    chunks = torch.split(tensor, chunk_size, dim=0)
                     # clone here, so that we can delete the original tensor
                     chunks = tuple(chunk.clone() for chunk in chunks)
                     del tensor  # release memory
@@ -631,6 +632,13 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
         item %= self.shard_size
         return {k: v[item] for k, v in dataset_shard.items()}
 
+    def __repr__(self):
+        lines = [f"ShardedSafetensorsDataset(size={len(self)}, shard_size={self.shard_size}, num_shards={len(self.shards)}\n"]
+        for shard in self.shards:
+            lines.append(f"    {repr(shard)}\n")
+        lines.append(")")
+        return "".join(lines)
+
     def get_shard(self, pos: Optional[int] = None) -> SafetensorsDataset:
         if pos is None:
             raise NotImplementedError("Cannot shard() a sharded dataset")
@@ -675,15 +683,15 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
         shard_datasets = tuple()
         for pos in range(num_shards):
             shard_tensors = {
-                key.split(".", 2)[2]: value
+                key[len(shard_prefix):]: value
                 for key, value in tensors.items()
-                if key.startswith("shards.")
+                if key.startswith(shard_prefix := f"shards.{pos}.")
             }
 
             shard_metadata = {
-                key.split(".", 2)[2]: value
+                key[len(shard_prefix):]: value
                 for key, value in metadata.items()
-                if key.startswith("shards.")
+                if key.startswith(shard_prefix := f"shards.{pos}.")
             }
 
             shard_dataset = SafetensorsDataset._load_from_dict(shard_tensors, shard_metadata)
