@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, overload, Self, Mapping, Any, Optional, Generator, Union
+from typing import Callable, overload, Self, Mapping, Any, Optional, Generator, Union, Sequence
 
 import torch.utils.data
 from torch import Tensor
@@ -94,7 +94,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     @staticmethod
     def pack_single_tensor(key: str, tensor: torch.Tensor) -> pack_return_t: ...
 
-    def pack_tensor_list(self, key: str, tensors: list[torch.Tensor]) -> pack_return_t: ...
+    def pack_tensor_list(self, key: str, tensors: Sequence[torch.Tensor]) -> pack_return_t: ...
 
 class ShardedSafetensorsDataset(torch.utils.data.Dataset):
     shards: tuple[SafetensorsDataset, ...]

@@ -1,11 +1,13 @@
 import gc
+import itertools
 import json
 import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, MutableMapping, Union
+from typing import Any, Callable, Mapping, Optional, MutableMapping, Union, Sequence
 
+import more_itertools
 import safetensors.torch
 from more_itertools.recipes import grouper
 from tqdm import trange, tqdm
@@ -44,6 +46,13 @@ def _get_items_from_tensor(t: torch.Tensor, indices: list[int]):
         return [t[i] for i in indices]
     return t[indices]
 
+def _get_len_of_item(i):
+    if isinstance(i, torch.Tensor):
+        return i.size(0)
+    elif isinstance(i, Sequence):
+        return len(i)
+    raise ValueError(f"{type(i)} is unknown")
+
 
 class SafetensorsDataset(torch.utils.data.Dataset):
     dataset: MutableMapping[str, list[torch.Tensor] | torch.Tensor]
@@ -73,13 +82,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         num_chunks = num_chunks + (remainder != 0)
 
         if not is_preprocessed:
-            raise NotImplementedError
             unprocessed_chunk_datasets: tuple[dict[str, list[torch.Tensor]], ...] = tuple(
                 dict()
                 for _ in range(num_chunks)
             )
             for key, list_of_tensors in self.dataset.items():
-                chunks_of_lists = grouper(list_of_tensors, n=chunk_size, incomplete='ignore')
+                chunks_of_lists = more_itertools.batched(list_of_tensors, n=chunk_size, strict=False)
                 for pos, chunk in enumerate(chunks_of_lists):
                     unprocessed_chunk_datasets[pos][key] = chunk
             return ShardedSafetensorsDataset(tuple(
@@ -168,7 +176,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                                 raise NotImplementedError
 
                             chunk_indices = indices[:, chunk_mask]
-                            chunk_indices[0] -= chunk_indices_dim0[0]
+                            chunk_indices[0] -= chunk_start
                             chunks = chunks + (torch.sparse_coo_tensor(
                                 chunk_indices.clone(),
                                 chunk_values.clone(),
@@ -228,7 +236,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
     def __len__(self):
-        return next((self._get_len_of_item(v) for v in self.dataset.values()), 0)
+        return next((_get_len_of_item(v) for v in self.dataset.values()), 0)
 
     @property
     def device(self) -> torch.device:
@@ -353,7 +361,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             is_tensor = isinstance(elem, torch.Tensor)
             if is_tensor and not elem.is_nested:
                 return nice_shape(elem.shape)
-            elif isinstance(elem, list) or (is_tensor and elem.is_nested):
+            elif isinstance(elem, Sequence) or (is_tensor and elem.is_nested):
                 shape = (len(elem) if not is_tensor else elem.size(0), )
                 inner_shape = None
                 for list_elem in elem:
@@ -370,14 +378,6 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
     def __del__(self):
         del self.dataset
-
-    @staticmethod
-    def _get_len_of_item(i):
-        if isinstance(i, torch.Tensor):
-            return i.size(0)
-        elif isinstance(i, list):
-            return len(i)
-        raise ValueError(f"{type(i)} is unknown ({i})")
 
     @staticmethod
     def unpack_list_tensor(key: str, metadata: Mapping[str, Any], meta: Mapping[str, Any], storage: Mapping[str, torch.Tensor]):
@@ -468,13 +468,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             return pack, metadata
         return {key: tensor}, None
 
-    def pack_tensor_list(self, key: str, tensors: list[torch.Tensor]) -> pack_return_t:
+    def pack_tensor_list(self, key: str, tensors: Sequence[torch.Tensor]) -> pack_return_t:
         if len(tensors) == 0:
             raise ValueError(f"Cannot save an empty list of tensors for key '{key}'")
         if not isinstance(tensors[0], torch.Tensor):
             raise ValueError(f"Elements of '{key}' are no tensors ... element 0 is {type(tensors[0])}")
         if len(tensors) != len(self):
             raise ValueError(f"'{key}' should have {len(self)} elements, but has {len(tensors)}")
+        if not isinstance(tensors, list):
+            tensors = list(tensors)
 
         dims = set(map(torch.Tensor.dim, tensors))  # noqa
         if max(dims) > min(dims):
@@ -541,8 +543,10 @@ class SafetensorsDataset(torch.utils.data.Dataset):
             pack, pack_metadata = None, None
             if isinstance(v, torch.Tensor):
                 pack, pack_metadata = self.pack_single_tensor(k, v)
-            elif isinstance(v, list):
+            elif isinstance(v, Sequence):
                 pack, pack_metadata = self.pack_tensor_list(k, v)
+            else:
+                raise ValueError(f"Cannot pack value type {type(v)} for key {k}")
 
             if pack is not None:
                 tensors.update(pack)
