@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, overload, Self, Mapping, Any, Optional, Generator, Union, Sequence
+from typing import Callable, overload, Self, Mapping, Any, Optional, Generator, Union, Sequence, MutableMapping
 
 import torch.utils.data
 from torch import Tensor
@@ -12,9 +12,9 @@ pack_metadata_t = dict[str, Any] | None
 pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
 
 class SafetensorsDataset(torch.utils.data.Dataset):
-    dataset: dict[str, list[torch.Tensor] | torch.Tensor]
+    dataset: dict[str, list[Any] | torch.Tensor]
 
-    def __init__(self, dataset: dict[str, list[torch.Tensor] | torch.Tensor]=None, preprocess: bool=False):
+    def __init__(self, dataset: MutableMapping[str, list[Any] | torch.Tensor] = None, preprocess: bool=False):
         pass
 
     def __contains__(self, item: str):

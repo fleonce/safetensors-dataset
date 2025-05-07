@@ -1,15 +1,17 @@
 import gc
-import itertools
 import json
 import warnings
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, MutableMapping, Union, Sequence
+from typing import (
+    Any, Callable, Mapping, Optional, MutableMapping, Union, Sequence, Iterable, Generic, TypeVar,
+    Protocol,
+)
 
 import more_itertools
 import safetensors.torch
-from more_itertools.recipes import grouper
+from more_itertools import first
 from tqdm import trange, tqdm
 import torch
 import torch.utils.data
@@ -28,6 +30,15 @@ pack_return_t = tuple[pack_tensor_t, pack_metadata_t]
 can_pack_nested_tensors_fast = hasattr(torch, "_nested_view_from_buffer")
 
 
+config = {
+    # control whether a sharded dataset should be
+    # split into multiple files, possibly improving
+    # performance as file handles are not shared and
+    # thus are smaller
+    "shards_into_separate_files": False
+}
+
+
 def _check_input_dict(m: dict):
     none_keys = set()
     empty_keys = set()
@@ -41,10 +52,15 @@ def _check_input_dict(m: dict):
     assert not none_keys, f"Found {len(none_keys)} keys with 'None' values: {', '.join(none_keys)}"
     assert not empty_keys, f"Found {len(empty_keys)} keys with empty lists as values: {', '.join(empty_keys)}"
 
-def _get_items_from_tensor(t: torch.Tensor, indices: list[int]):
-    if isinstance(t, list) or t.is_nested or t.is_sparse:
-        return [t[i] for i in indices]
-    return t[indices]
+def _check_is_tensor(key: str, value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    raise ValueError(f"Key {key} must be a tensor, but is a {type(value)}")
+
+def _get_items_from_tensor(key: str, tensor: torch.Tensor, indices: list[int]):
+    if isinstance(tensor, Sequence) or tensor.is_nested or tensor.is_sparse:
+        return [_check_is_tensor(key, tensor[i]) for i in indices]
+    return tensor[indices]
 
 def _get_len_of_item(i):
     if isinstance(i, torch.Tensor):
@@ -54,8 +70,35 @@ def _get_len_of_item(i):
     raise ValueError(f"{type(i)} is unknown")
 
 
+class SupportsGetItem(Protocol):
+    def __getitem__(self, item: int): ...
+
+
+class DatasetIterator:
+    def __init__(self, dataset: SupportsGetItem):
+        self.size = None
+        self.dataset = dataset
+        self.pos = 0
+
+    def _size(self):
+        if self.size is None:
+            self.size = len(self.dataset)
+        return self.size
+
+    def __len__(self):
+        return self._size()
+
+    def __next__(self):
+        if self.pos < self._size():
+            try:
+                return self.dataset[self.pos]
+            finally:
+                self.pos += 1
+        raise StopIteration
+
+
 class SafetensorsDataset(torch.utils.data.Dataset):
-    dataset: MutableMapping[str, list[torch.Tensor] | torch.Tensor]
+    dataset: MutableMapping[str, list[Any] | torch.Tensor]
     layout: dict[str, bool]
 
     def __init__(self, dataset=None, preprocess=False):
@@ -72,39 +115,23 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         if len(self) <= chunk_size:
             raise ValueError(f"Dataset size is smaller than chunk size ({len(self)} < {chunk_size})")
 
-        is_preprocessed = all(
-            isinstance(tensor, torch.Tensor)
-            for tensor in self.dataset.values()
-        )
-
         length = len(self)
         num_chunks, remainder = divmod(length, chunk_size)
         num_chunks = num_chunks + (remainder != 0)
 
-        if not is_preprocessed:
-            unprocessed_chunk_datasets: tuple[dict[str, list[torch.Tensor]], ...] = tuple(
-                dict()
-                for _ in range(num_chunks)
-            )
-            for key, list_of_tensors in self.dataset.items():
-                chunks_of_lists = more_itertools.batched(list_of_tensors, n=chunk_size, strict=False)
-                for pos, chunk in enumerate(chunks_of_lists):
-                    unprocessed_chunk_datasets[pos][key] = chunk
-            return ShardedSafetensorsDataset(tuple(
-                SafetensorsDataset(unprocessed_chunk, preprocess=preprocess_if_unprocessed)
-                for unprocessed_chunk in unprocessed_chunk_datasets
-            ))
-        else:
-            chunk_datasets: tuple[dict[str, torch.Tensor], ...] = tuple(
-                dict()
-                for _ in range(num_chunks)
-            )
+        chunk_datasets: tuple[dict[str, Union[torch.Tensor, list[Any]]], ...] = tuple(
+            dict()
+            for _ in range(num_chunks)
+        )
 
-            keys = set(self.dataset.keys())
-            for key in keys:
-                tensor = self.dataset.pop(key)
-                if not isinstance(tensor, torch.Tensor):
-                    raise ValueError(f"tensor must be torch.Tensor, but got {type(tensor)}")
+        keys = set(self.dataset.keys())
+        for key in keys:
+            value = self.dataset.pop(key)
+            if isinstance(value, Iterable) and not isinstance(value, torch.Tensor):
+                chunks_of_lists = more_itertools.batched(value, n=chunk_size, strict=False)
+                for pos, chunk in enumerate(chunks_of_lists):
+                    chunk_datasets[pos][key] = chunk
+            elif isinstance(tensor := value, torch.Tensor):
                 is_nested = tensor.is_nested
                 is_sparse = tensor.is_sparse
 
@@ -195,10 +222,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
                 for pos in range(num_chunks):
                     chunk_datasets[pos][key] = chunks[pos]
-            return ShardedSafetensorsDataset(tuple(
-                SafetensorsDataset(chunk)
-                for chunk in chunk_datasets
-            ))
+            else:
+                raise ValueError(f"value in dataset must be an Iterable or torch.Tensor, but got {type(value)}")
+        return ShardedSafetensorsDataset(tuple(
+            SafetensorsDataset(chunk, preprocess=preprocess_if_unprocessed)
+            for chunk in chunk_datasets
+        ))
 
     def filter(
         self,
@@ -229,14 +258,17 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def __getitem__(self, item: int | str) -> dict[str, torch.Tensor] | torch.Tensor:
         if isinstance(item, str):
             return self.dataset[item]
-        return {k: v[item] for k, v in self.dataset.items()}
+        return {k: _check_is_tensor(k, v[item]) for k, v in self.dataset.items()}
 
     def __getitems__(self, indices: list[int]):
-        elements_per_key = {k: _get_items_from_tensor(v, indices) for k, v in self.dataset.items()}
+        elements_per_key = {k: _get_items_from_tensor(k, v, indices) for k, v in self.dataset.items()}
         return [{k: elements_per_key[k][i] for k in elements_per_key.keys()} for i in range(len(indices))]
 
     def __len__(self):
         return next((_get_len_of_item(v) for v in self.dataset.values()), 0)
+
+    def __iter__(self):
+        return DatasetIterator(self)
 
     @property
     def device(self) -> torch.device:
@@ -260,7 +292,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         batched: bool = False,
         batch_size: int = 1,
     ) -> "SafetensorsDataset":
-        info = info or self.info()
+        info = info or dict()
         map_dataset: MutableMapping[str, torch.Tensor] = {}
         items = self._transpose(batched, batch_size)
         done = 0
@@ -303,11 +335,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
     def info(self) -> Mapping[str, TensorLayout]:
         def tensor_layout_for_key(k: str):
             if isinstance(self.dataset[k], list):
+                if not isinstance(first(self.dataset[k]), torch.Tensor):
+                    return TensorLayout.NO_TENSOR
                 shapes = set(map(lambda x: x.shape, self.dataset[k]))
                 if len(shapes) > 1:
                     return TensorLayout.VARYING_DIM_SIZE
                 return TensorLayout.STANDARD
-            if self.dataset[k].is_nested or self.dataset[k].is_sparse:
+            elif not isinstance(self.dataset[k], torch.Tensor):
+                return TensorLayout.NO_TENSOR
+            elif self.dataset[k].is_nested or self.dataset[k].is_sparse:
                 return TensorLayout.VARYING_DIM_SIZE
             return TensorLayout.STANDARD
         return {
@@ -357,6 +393,16 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         def nice_shape(shape):
             return "[" + " x ".join(map(str, shape)) + "]"
 
+        def nested_shape(elem):
+            elem_type = type(elem).__name__
+            if isinstance(elem, str):
+                return (elem_type,)
+            elif isinstance(elem, torch.Tensor):
+                return tuple(elem.shape)
+            elif isinstance(elem, Iterable):
+                return (elem_type,) + nested_shape(first(elem))
+            return elem_type
+
         def shape_for_elem(elem):
             is_tensor = isinstance(elem, torch.Tensor)
             if is_tensor and not elem.is_nested:
@@ -365,6 +411,9 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 shape = (len(elem) if not is_tensor else elem.size(0), )
                 inner_shape = None
                 for list_elem in elem:
+                    if not isinstance(list_elem, torch.Tensor):
+                        inner_shape = nested_shape(list_elem)
+                        break
                     inner_shape = inner_shape or list_elem.shape
                     inner_shape = tuple(map(max, inner_shape, list_elem.shape))
                 shape = shape + inner_shape

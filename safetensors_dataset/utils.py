@@ -1,9 +1,10 @@
 import json
 from enum import Enum
 from pathlib import Path
-from typing import cast, MutableMapping, Mapping, Literal, Any
+from typing import cast, MutableMapping, Mapping, Any
 
 import torch
+from more_itertools import first
 
 
 def get_torch_dtype_from_str(dtype: str) -> torch.dtype:
@@ -18,7 +19,10 @@ def get_torch_dtype_from_str(dtype: str) -> torch.dtype:
     return cast(torch.dtype, getattr(torch, dtype_name))
 
 
-def slice_tensor(tensor: torch.Tensor, s: slice):
+def slice_tensor(tensor: Any, s: slice):
+    if not isinstance(tensor, torch.Tensor):
+        return tensor[s]
+
     if tensor.is_nested:
         dim = tensor.size(0)
         stop = min(s.stop if s.stop is not None else dim, dim)
@@ -29,6 +33,7 @@ def slice_tensor(tensor: torch.Tensor, s: slice):
 
 class TensorLayout(Enum):  # TensorStructure ?
     STANDARD = 1
+    NO_TENSOR = 2
     VARYING_DIM_SIZE = 3
 
 
@@ -122,15 +127,54 @@ def _map_into_dataset(
 
 
 def _map_batch_into_dataset(
-    dataset: MutableMapping[str, torch.Tensor],
+    dataset: MutableMapping[str, torch.Tensor | list[Any]],
     result: Mapping[str, torch.Tensor],
     info: Mapping[str, TensorLayout],
-    batched: bool
+    batched: bool,
+    strict: bool = False,
 ) -> Mapping[str, TensorLayout]:
     known_layouts = dict(info)
     for key, value in result.items():
         tensor_layout = known_layouts.get(key, TensorLayout.STANDARD)
         dataset_value = dataset.get(key, None)
+        if not isinstance(value, torch.Tensor):
+            if (
+                isinstance(value, (list, tuple))
+                and isinstance(first(value), torch.Tensor)
+            ):
+                if dataset_value is None:
+                    if len(set(map(lambda t: t.shape, value))) == 1:
+                        dataset[key] = torch.stack(value, dim=0)
+                    elif first(value).is_sparse:
+                        raise NotImplementedError("sparse lists")
+                    else:
+                        dataset[key] = torch.nested.nested_tensor(value)
+                elif dataset_value.is_sparse:
+                    raise NotImplementedError()
+                elif dataset_value.is_nested:
+                    value = torch.nested.nested_tensor(value)
+
+                    dataset[key] = torch.cat((dataset_value, value), dim=0)
+                else:
+                    if len(set(map(lambda t: t.shape, value))) == 1:
+                        value = torch.stack(value, dim=0)
+                    elif first(value).is_sparse:
+                        raise NotImplementedError("sparse lists")
+                    else:
+                        dataset_value = torch.nested.as_nested_tensor(dataset_value)
+                        value = torch.nested.nested_tensor(value)
+                    dataset[key] = torch.cat((dataset_value, value), dim=0)
+            else:
+                if strict:
+                    raise ValueError(f"{key} must be a torch.Tensor, got a {type(value)}")
+                else:
+                    if dataset_value is not None and not isinstance(dataset_value, list):
+                        raise ValueError(f"{key} must be a {type(value)}, previously got a torch.Tensor")
+                    elif dataset_value is None:
+                        dataset[key] = [value]
+                    else:
+                        dataset_value.append(value)
+            continue
         if dataset_value is None:
             if tensor_layout in {TensorLayout.STANDARD, TensorLayout.VARYING_DIM_SIZE}:
                 if not batched:
@@ -138,6 +182,8 @@ def _map_batch_into_dataset(
                 if value.is_sparse and not value.is_coalesced():
                     value = value.coalesce()
                 dataset[key] = value
+            elif tensor_layout == TensorLayout.NO_TENSOR:
+                dataset[key] = [value]
             else:
                 raise NotImplementedError(tensor_layout)  # not needed!
         else:
@@ -207,6 +253,8 @@ def _map_batch_into_dataset(
                             dataset[key] = value
                         else:
                             raise NotImplementedError(batched)
+            elif tensor_layout == TensorLayout.NO_TENSOR:
+                dataset_value.append(value)
             else:
                 raise NotImplementedError(tensor_layout)
 
