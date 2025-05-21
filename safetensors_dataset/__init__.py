@@ -1,4 +1,4 @@
-from .safetensors import SafetensorsDataset
+from .dict_dataset import SafetensorsDataset
 from .safetensors_dict import SafetensorsDict
 from .sequence_dataset import SequenceSafetensorsDataset
 from .loading import load_safetensors

@@ -1,7 +1,7 @@
 import gc
 import json
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -21,7 +21,8 @@ from safetensors_dataset.version import __version__
 from safetensors_dataset.utils import (
     get_torch_dtype_from_str,
     TensorLayout,
-    _map_batch_into_dataset, _map_into_dataset, slice_tensor, _load_safetensors_metadata,
+    _map_batch_into_dataset, _map_into_dataset, slice_tensor, _load_safetensors_metadata, _apply_function_to_iterable,
+    _maybe_wrap_index, _CHECK_INVARIANTS,
 )
 
 pack_tensor_t = dict[str, torch.Tensor]
@@ -173,8 +174,8 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                     else:
                         raise NotImplementedError("nested", type(tensor))
                 elif is_sparse and not is_nested:
-                    indices = tensor.indices()
-                    values = tensor.values()
+                    indices = tensor._indices()
+                    values = tensor._values()
                     if indices.numel() == 0:
                         if tensor.layout == torch.sparse_coo:
                             chunks = tuple(
@@ -182,7 +183,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                                     indices,
                                     values,
                                     size=(chunk_size if pos + 1 != num_chunks else remainder,) + tensor.shape[1:],
-                                    check_invariants=False,
+                                    check_invariants=_CHECK_INVARIANTS,
                                     is_coalesced=tensor.is_coalesced()
                                 )
                                 for pos in range(num_chunks)
@@ -208,7 +209,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                                 chunk_indices.clone(),
                                 chunk_values.clone(),
                                 (chunk_size if pos + 1 != num_chunks else remainder,) + tensor.shape[1:],
-                                    check_invariants=False,
+                                check_invariants=_CHECK_INVARIANTS,
                                 is_coalesced=tensor.is_coalesced()
                             ),)
                         del tensor
@@ -237,7 +238,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         filtered_dataset = dict({k: list() for k in self.dataset.keys()})
         from_to = range if not use_tqdm else partial(trange, leave=False)
         for i in from_to(len(self)):
-            elem = self[i]
+            elem = self.__getitem__unsafe(i)
             if filter_fn(elem):
                 for k in filtered_dataset.keys():
                     filtered_dataset[k].append(elem[k])
@@ -254,6 +255,11 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
     def keys(self) -> set[str]:
         return set(self.dataset.keys())
+
+    def __getitem__unsafe(self, item: int | str):
+        if isinstance(item, str):
+            return self.dataset[item]
+        return {k: v[item] for k, v in self.dataset.items()}
 
     def __getitem__(self, item: int | str) -> dict[str, torch.Tensor] | torch.Tensor:
         if isinstance(item, str):
@@ -288,40 +294,22 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         self,
         func: Callable[[Mapping[str, torch.Tensor]], Mapping[str, torch.Tensor]],
         info: Optional[Mapping[str, TensorLayout]] = None,
+        strict: bool = False,
         use_tqdm: bool = True,
         batched: bool = False,
         batch_size: int = 1,
     ) -> "SafetensorsDataset":
-        info = info or dict()
-        map_dataset: MutableMapping[str, torch.Tensor] = {}
         items = self._transpose(batched, batch_size)
-        done = 0
-        n_elem = len(self)
-        with tqdm(disable=not use_tqdm, total=len(self)) as progress_bar:
-            for pos, item in enumerate(items):
-                transformed_item = func(item)
-                for key in transformed_item.keys():
-                    if pos > 0 and key not in map_dataset:
-                        raise ValueError(key + " was added after the first item")
+        dataset = _apply_function_to_iterable(
+            func,
+            items,
+            len(self),
+            batched=batched,
+            batch_size=batch_size,
+            disable_tqdm=not use_tqdm,
+        )
 
-                _map_batch_into_dataset(
-                    map_dataset,
-                    transformed_item,
-                    info,
-                    batched
-                )
-                new_done = done + (not batched or batch_size)
-                progress = new_done - done - (new_done % n_elem if new_done > n_elem else 0)
-                progress_bar.update(progress)
-                done += progress
-
-        for key in self.keys():
-            tensor_layout = info.get(key, TensorLayout.STANDARD)
-            if tensor_layout == TensorLayout.VARYING_DIM_SIZE:
-                if not map_dataset[key].is_nested and not map_dataset[key].is_sparse:
-                    warnings.warn(f"{tensor_layout} was specified for {key} but shape is consistent across all elements")
-
-        return self.__class__(map_dataset)
+        return self.__class__(dataset, preprocess=False)
 
     def select(self, indices: list[int], use_tqdm=False) -> "SafetensorsDataset":
         select_dataset: MutableMapping[str, torch.Tensor] = {}
@@ -395,13 +383,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
         def nested_shape(elem):
             elem_type = type(elem).__name__
-            if isinstance(elem, str):
+            if elem is None:
+                return tuple()
+            elif isinstance(elem, str):
                 return (elem_type,)
             elif isinstance(elem, torch.Tensor):
                 return tuple(elem.shape)
             elif isinstance(elem, Iterable):
-                return (elem_type,) + nested_shape(first(elem))
-            return elem_type
+                return (elem_type,) + nested_shape(first(elem, None))
+            return (elem_type,)
 
         def shape_for_elem(elem):
             is_tensor = isinstance(elem, torch.Tensor)
@@ -420,10 +410,15 @@ class SafetensorsDataset(torch.utils.data.Dataset):
                 return nice_shape(shape)
             else:
                 raise ValueError(f"Unknown element type {type(elem)}")
-        shapes = str({k: shape_for_elem(v) for k, v in self.dataset.items()})
-        size = len(self)
-
-        return f"SafetensorsDataset(size={size}, shapes={shapes})"
+        shapes = list()
+        shapes_of_keys = defaultdict(list)
+        for key, value in self.dataset.items():
+            shapes_of_keys[shape_for_elem(value)].append(key)
+        comma = ", "
+        for shape, keys in shapes_of_keys.items():
+            shapes.append(comma.join(keys) + "=" + shape)
+        comma_lf = ",\n  "
+        return f"SafetensorsDataset(\n  {comma_lf.join(shapes)}\n)"
 
     def __del__(self):
         del self.dataset
@@ -464,14 +459,14 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         dtype = get_torch_dtype_from_str(dtype)
         if dtype == torch.bool and key + ".indices" not in storage:
             tensor = storage[key]
-            tensor = torch.sparse_coo_tensor(tensor, torch.ones(tensor.size(-1), dtype=dtype), size=tuple(dims))
+            tensor = torch.sparse_coo_tensor(tensor, torch.ones(tensor.size(-1), dtype=dtype), size=tuple(dims), check_invariants=_CHECK_INVARIANTS)
             tensor = tensor.coalesce()
         else:
             indices = storage[key + ".indices"]
             if key + ".values" not in storage:
                 raise ValueError(f"Need {key}.values to restore sparsely stored tensor")
             values = storage[key + ".values"]
-            tensor = torch.sparse_coo_tensor(indices, values, size=dims)
+            tensor = torch.sparse_coo_tensor(indices, values, size=dims, check_invariants=_CHECK_INVARIANTS)
             tensor = tensor.coalesce()
         return tensor
 
@@ -482,12 +477,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         if tensor.is_sparse:
             if tensor.dtype == torch.bool:
                 pack = {
-                    key: tensor.indices()
+                    key: tensor._indices()
                 }
             else:
                 pack = {
-                    key + ".values": tensor.values(),
-                    key + ".indices": tensor.indices()
+                    key + ".values": tensor._values(),
+                    key + ".indices": tensor._indices()
                 }
             metadata = {
                 "sparse": True,
@@ -538,12 +533,12 @@ class SafetensorsDataset(torch.utils.data.Dataset):
 
         if is_sparse:
             sparse_shape = tuple(max(map(lambda x: x.size(dim), tensors)) for dim in range(min(dims)))
-            same_size_tensors = list(map(lambda t: torch.sparse_coo_tensor(t.indices(), t.values(), size=sparse_shape), tensors))
+            same_size_tensors = list(map(lambda t: torch.sparse_coo_tensor(t._indices(), t._values(), size=sparse_shape, check_invariants=_CHECK_INVARIANTS), tensors))
             sparse_tensor = torch.stack(same_size_tensors, dim=0).coalesce()
             if sparse_tensor.dtype == torch.bool:
-                pack = {key: sparse_tensor.indices()}
+                pack = {key: sparse_tensor._indices()}
             else:
-                pack = {key + ".indices": sparse_tensor.indices(), key + ".values": sparse_tensor.values()}
+                pack = {key + ".indices": sparse_tensor._indices(), key + ".values": sparse_tensor._values()}
             metadata = {
                 "sparse": True,
                 "dims": sparse_tensor.shape,
@@ -676,8 +671,7 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
     def __getitem__(self, item: int | str) -> dict[str, torch.Tensor] | torch.Tensor:
         if isinstance(item, str):
             raise NotImplementedError(f"Cannot access keys for sharded datasets")
-        if item < 0:
-            item = len(self) - abs(item)
+        item = _maybe_wrap_index(item, len(self))
         shard = item // self.shard_size
         if shard >= len(self.shards) or item >= len(self):
             raise IndexError(item)
@@ -686,9 +680,12 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
         return {k: v[item] for k, v in dataset_shard.items()}
 
     def __repr__(self):
-        lines = [f"ShardedSafetensorsDataset(size={len(self)}, shard_size={self.shard_size}, num_shards={len(self.shards)}\n"]
+        lines = [f"ShardedSafetensorsDataset(size={len(self)}, shard_size={self.shard_size}, num_shards={len(self.shards)},\n"]
+        lf = "\n"
+        lfspace = "\n  "
         for shard in self.shards:
-            lines.append(f"    {repr(shard)}\n")
+
+            lines.append(f"  {repr(shard).replace(lf, lfspace)}\n")
         lines.append(")")
         return "".join(lines)
 
@@ -699,11 +696,17 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
 
     def __getitems__(self, indices: list[int]):
         buckets: MutableMapping[int, list[int]] = dict()
+        size = len(self)
+        wrapped_indices = list()
         for index in indices:
-            bucket = index // self.shard_size
+            wrapped_index = _maybe_wrap_index(index, size)
+            if wrapped_index >= size:
+                raise IndexError(f"Index {index} ({wrapped_index}) is out of range for {self}")
+            wrapped_indices.append(wrapped_index)
+            bucket = wrapped_index // self.shard_size
             if bucket not in buckets:
                 buckets[bucket] = list()
-            buckets[bucket].append(index % self.shard_size)
+            buckets[bucket].append(wrapped_index % self.shard_size)
 
         bucket_items: MutableMapping[int, list[dict[str, torch.Tensor]]] = dict()
         for bucket, bucket_indices in buckets.items():
@@ -711,7 +714,7 @@ class ShardedSafetensorsDataset(torch.utils.data.Dataset):
 
         return [
             bucket_items[index // self.shard_size][buckets[index // self.shard_size].index(index % self.shard_size)]
-            for index in indices
+            for index in wrapped_indices
         ]
 
     def save_to_file(self, path: Union[str, Path]):

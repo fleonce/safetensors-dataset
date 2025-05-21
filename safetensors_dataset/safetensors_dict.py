@@ -8,7 +8,7 @@ from typing import Callable, Optional, Mapping, Union, TypeAlias
 import torch
 from more_itertools.more import first
 
-from .safetensors import SafetensorsDataset
+from .dict_dataset import SafetensorsDataset
 from .utils import TensorLayout
 
 STK: TypeAlias = Union[str, int]
@@ -111,4 +111,15 @@ class SafetensorsDict(dict[STK, SafetensorsDataset]):
         with open(index_path, "w") as f:
             json.dump([{"split": key, "file": value.name} for key, value in index_dict.items()], f, indent=2)
 
+    def __repr__(self):
+        datasets = [f"SafetensorsDict(size={len(self)},"]
+        tab = "  "
+        for key, value in self.items():
+            value_repr = repr(value).replace("\n", "\n  ")
+            datasets.append(f"{tab}{key}={value_repr}")
+        datasets.append(")")
+        if len(datasets) > 5:
+            datasets = datasets[:4] + [f"{tab} ... ({len(datasets) - 5} more)"] + datasets[-1:]
+
+        return "\n".join(datasets)
 

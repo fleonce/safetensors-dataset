@@ -1,5 +1,6 @@
 import inspect
 import warnings
+from collections import deque
 from typing import (
     Iterable,
     Mapping,
@@ -16,11 +17,41 @@ from typing import (
 
 import more_itertools
 import torch
+import safetensors.torch
 from more_itertools.more import first
 from tqdm import tqdm
 
-from safetensors_dataset.safetensors import SafetensorsDataset, ShardedSafetensorsDataset
-from safetensors_dataset.utils import TensorLayout, _map_batch_into_dataset
+from safetensors_dataset.dict_dataset import SafetensorsDataset, ShardedSafetensorsDataset
+from safetensors_dataset.utils import TensorLayout, _map_batch_into_dataset, _apply_function_to_iterable
+
+
+class CachingIterable:
+    def __init__(self, generator):
+        self.generator = iter(generator)
+        self.cache = deque()
+        self.size = 0
+        self.exhausted = False
+
+    def __len__(self):
+        if not self.exhausted:
+            return sum(map(lambda _: 1, self))
+        return self.size
+
+    def __next__(self):
+        try:
+            entry = next(self.generator)
+            self.cache.append(entry)
+            self.size += 1
+            return entry
+        except StopIteration:
+            self.exhausted = True
+            self.generator = None
+            raise
+
+    def __iter__(self):
+        if self.exhausted:
+            return iter(self.cache)
+        return self
 
 
 class SequenceSafetensorsDataset:
@@ -31,7 +62,12 @@ class SequenceSafetensorsDataset:
     dataset: Iterable[Mapping[str, Any]]
 
     def __init__(self, dataset: Optional[Iterable[Mapping[str, Any]]] = None):
-        self.dataset = dataset or tuple()
+        if dataset is None:
+            dataset = tuple()
+        elif not isinstance(dataset, Sequence):
+            dataset = CachingIterable(dataset)
+
+        self.dataset = dataset
 
     def __contains__(self, item: str):
         # we assume a homogenous dataset,
@@ -173,9 +209,6 @@ class SequenceSafetensorsDataset:
         batched: bool = False,
         batch_size: int = 1,
     ) -> "SafetensorsDataset":
-        info = info or self.info()
-        map_dataset: MutableMapping[str, torch.Tensor] = {}
-
         def batch_fn():
             for batch in more_itertools.batched(self.dataset, n=batch_size):
                 out_batch = {_key: [] for _key in batch[0].keys()}
@@ -190,45 +223,9 @@ class SequenceSafetensorsDataset:
             else batch_fn()
         )
 
-        def _add_batch(batch):
-            for _key in batch.keys():
-                if pos > 0 and _key not in map_dataset:
-                    raise ValueError(_key + " was added after the first item")
+        dataset = _apply_function_to_iterable(func, items, len(self), batched, batch_size, disable_tqdm=not use_tqdm)
 
-            _map_batch_into_dataset(
-                map_dataset,
-                batch,
-                info,
-                batched,
-                strict,
-            )
-
-        done = 0
-        n_elem = len(self)
-        with tqdm(disable=not use_tqdm, total=len(self)) as progress_bar:
-            for pos, item in enumerate(items):
-                transformed_item = func(item)
-                if isinstance(transformed_item, Sequence) or inspect.isgenerator(transformed_item):
-                    list(map(_add_batch, transformed_item))
-                else:
-                    _add_batch(transformed_item)
-
-                new_done = done + (not batched or batch_size)
-                progress = new_done - done - (new_done % n_elem if new_done > n_elem else 0)
-                progress_bar.update(progress)
-                done += progress
-
-        for key in map_dataset.keys():
-            tensor_layout = info.get(key, TensorLayout.STANDARD)
-            if tensor_layout == TensorLayout.VARYING_DIM_SIZE:
-                if not isinstance(map_dataset[key], torch.Tensor):
-                    continue
-                if not map_dataset[key].is_nested and not map_dataset[key].is_sparse:
-                    warnings.warn(
-                        f"{tensor_layout} was specified for {key} but shape is consistent across all elements"
-                        )
-
-        return SafetensorsDataset(map_dataset)
+        return SafetensorsDataset(dataset, preprocess=True)
 
     def select(self, indices: list[int], use_tqdm=False) -> "SafetensorsDataset":
         raise NotImplementedError()
@@ -268,3 +265,6 @@ class SequenceSafetensorsDataset:
 
     def __del__(self):
         del self.dataset
+
+
+SequenceSafetensorsDataset.from_iterable(a for a in range(100))

@@ -1,10 +1,13 @@
+import inspect
 import json
 from enum import Enum
 from pathlib import Path
-from typing import cast, MutableMapping, Mapping, Any
+from typing import cast, MutableMapping, Mapping, Any, Sequence, Union, Generator
 
 import torch
 from more_itertools import first
+from more_itertools.recipes import flatten
+from tqdm import tqdm
 
 
 def get_torch_dtype_from_str(dtype: str) -> torch.dtype:
@@ -59,14 +62,142 @@ def _load_safetensors_metadata(fp: str | Path) -> dict[str, Any]:
         metadata = {k: json.loads(v) for k, v in metadata.items()}
         return metadata
 
+_CHECK_INVARIANTS = False
+
+def _concat_sparse_tensors_of_different_shapes(tensors: Sequence[torch.Tensor], batched: bool):
+    if not batched:
+        tensors = [tensor.unsqueeze(0) for tensor in tensors]
+
+    pos, numel = 0, 0
+    indices, values = list(), list()
+    max_sizes = (len(tensors),) + (0,) * (tensors[0].dim() - 1)
+    is_coalesced = True
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"Element {pos} is not a Tensor but a {type(tensor)}")
+
+        tensor_indices = tensor._indices()  # avoid coalesc'ing check
+        tensor_values = tensor._values()
+        is_coalesced = is_coalesced and tensor.is_coalesced()
+
+        tensor_indices[0] += pos
+        pos += tensor.size(0)
+        numel += tensor_values.numel()
+        indices.append(tensor_indices)
+        values.append(tensor_values)
+
+        max_sizes = tuple(max(tensor_size, max_size) for tensor_size, max_size in zip(tensor.shape, max_sizes))
+
+    if numel > 0:
+        indices = torch.cat(indices, dim=1)
+        values = torch.cat(values, dim=0)
+    else:
+        indices = tensors[0].new_empty((len(max_sizes), 0), dtype=torch.long, layout=torch.strided)
+        values = tensors[0].new_empty((0,), layout=torch.strided)
+
+    return torch.sparse_coo_tensor(
+        indices,
+        values,
+        size=max_sizes,
+        is_coalesced=is_coalesced or numel == 0,
+        check_invariants=_CHECK_INVARIANTS
+    )
+
+
+def _maybe_wrap_index(pos: int, size: int) -> int:
+    if pos < 0:
+        return size + pos
+    return pos
+
+
+def _apply_function_to_iterable(
+    func,
+    iterable,
+    numel: int,
+    batched: bool,
+    batch_size: int,
+    disable_tqdm: bool = False,
+):
+    def _collect_output(
+        output: Union[Sequence[Mapping[str, Any]], Generator[Mapping[str, Any], None, None], Mapping[str, Any]],
+        target: MutableMapping[str, list[Any]],
+    ):
+        if isinstance(output, bool) and output is False:
+            return
+        elif (
+            isinstance(output, Sequence)
+            or inspect.isgenerator(output)
+        ):
+            for element in output:
+                _collect_output(element, target)
+        else:
+            for key, value in output.items():
+                if key not in target:
+                    target[key] = list()
+                target[key].append(value)
+
+    out = {}
+    done = 0
+    desc = getattr(func, "__name__", None)
+    with tqdm(desc=desc, disable=disable_tqdm, total=numel) as progress_bar:
+        for pos, item in enumerate(iterable):
+            _collect_output(func(item), out)
+
+            new_done = done + (not batched or batch_size)
+            progress = new_done - done - (new_done % numel if new_done > numel else 0)
+            progress_bar.update(progress)
+            done += progress
+
+    return _map_into_dataset(out, batched=batched)
+
+
+def _batched_map_into_dataset(
+    dataset: Mapping[str, list[torch.Tensor] | tuple[torch.Tensor, ...]]
+) -> MutableMapping[str, torch.Tensor]:
+    map_dataset = dict()
+    for key, value in dataset.items():
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                continue
+
+            first_value = first(value)
+            if not isinstance(first_value, torch.Tensor):
+                map_dataset[key] = list(flatten(value))
+                continue
+            is_nested = (
+                first_value.is_nested
+            )
+            if not is_nested:
+                if len(set(map(lambda t: t.shape[1:], value))) == 1:
+                    tensor = torch.cat(value, dim=0)
+                elif not any(map(lambda t: t.is_sparse, value)):
+                    if not isinstance(value, list):
+                        value = list(value)
+                    tensor = torch.nested.nested_tensor(value)
+                else:
+                    tensor = _concat_sparse_tensors_of_different_shapes(value, batched=True)
+            else:
+                tensor = torch.cat(value, dim=0)
+            map_dataset[key] = tensor
+        elif isinstance(value, torch.Tensor):
+            map_dataset[key] = value
+        else:
+            raise ValueError(f"Keys must be tuple, list or torch.Tensor, got {type(value)} for {key}")
+    return map_dataset
 
 def _map_into_dataset(
     dataset: Mapping[str, torch.Tensor | list[torch.Tensor]],
+    batched: bool = False,
 ) -> MutableMapping[str, torch.Tensor]:
+    if batched:
+        return _batched_map_into_dataset(dataset)
     map_dataset = dict()
     for key, value in dataset.items():
         if isinstance(value, list):
             if len(value) == 0:
+                continue
+            if not isinstance(first(value), torch.Tensor):
+                map_dataset[key] = value
                 continue
             if len(set(map(lambda t: t.shape, value))) == 1:
                 # everything has the same length, easy!
@@ -76,50 +207,7 @@ def _map_into_dataset(
                 value = torch.nested.nested_tensor(value)
                 map_dataset[key] = value
             else:
-                if not all(map(lambda t: t.is_sparse, value)):
-                    raise ValueError(f"Either every element for {key} must be sparse or none")
-                dims = set(map(lambda t: t.dim(), value))
-                if not len(dims) == 1:
-                    raise ValueError(f"{key}: mismatching dimensions: {dims}")
-                batch_sizes = set(map(lambda t: t.size(0), value))
-                if batch_sizes != {1}:
-                    value = [elem.unsqueeze(0) for elem in value]
-                batch_size = len(value)
-
-                indices, values = list(), list()
-                a = set()
-                for pos, tensor in enumerate(value):
-                    if not isinstance(tensor, torch.Tensor):
-                        raise ValueError(f"Element {pos} in {key} is not a Tensor but a {type(tensor)}")
-                    if not tensor.is_coalesced():
-                        tensor = tensor.coalesce()
-                    tensor_indices = tensor.indices()
-                    tensor_indices[0] += pos
-                    if tensor_indices.numel() > 0:
-                        a.add(tensor_indices[0].unique().item())
-                    indices.append(tensor_indices)
-                    values.append(tensor.values())
-                indices = torch.cat(indices, dim=1)
-                values = torch.cat(values, dim=0)
-
-                if indices.numel() == 0:
-                    max_sizes = tuple()
-                    for dim in range(value[0].dim()):
-                        max_sizes = max_sizes + (max(elem.size(dim) for elem in value),)
-                    max_sizes = (len(value),) + max_sizes[1:]
-                    value = torch.sparse_coo_tensor(indices, values, size=max_sizes)
-                    map_dataset[key] = value
-                    continue
-
-                new_value = torch.sparse_coo_tensor(
-                    indices,
-                    values,
-                    (batch_size,) + indices.amax(dim=1).add(1).unbind(dim=0)[1:],
-                    is_coalesced=True
-                )
-
-                if new_value.size(0) != len(value):
-                    raise ValueError(key, new_value.shape, len(value))
+                new_value = _concat_sparse_tensors_of_different_shapes(value, batched=False)
                 map_dataset[key] = new_value
         else:
             map_dataset[key] = value
@@ -140,6 +228,7 @@ def _map_batch_into_dataset(
         if not isinstance(value, torch.Tensor):
             if (
                 isinstance(value, (list, tuple))
+                and len(value) > 0
                 and isinstance(first(value), torch.Tensor)
             ):
                 if dataset_value is None:
@@ -187,23 +276,36 @@ def _map_batch_into_dataset(
             else:
                 raise NotImplementedError(tensor_layout)  # not needed!
         else:
+            if not isinstance(dataset_value, torch.Tensor):
+                raise ValueError(f"dataset_value must be a torch.Tensor, got {type(dataset_value)}")
+
+            if tensor_layout in {TensorLayout.STANDARD, TensorLayout.VARYING_DIM_SIZE}:
+                value = _match_dims(key, value, dataset_value, batched)
+                if dataset_value.is_nested or (value.dim() > 1 and value.size(1) != (
+                    dataset_value.size(1) if not dataset_value.is_nested
+                    else max(map(lambda t: t.size(0), dataset_value.unbind(0)))
+                )):
+                    tensor_layout = TensorLayout.VARYING_DIM_SIZE
             if tensor_layout == TensorLayout.STANDARD:
-                value = _match_dims(key, value, dataset_value, batched)
-
-                dataset[key] = torch.cat((dataset_value, value))
-            elif tensor_layout == TensorLayout.VARYING_DIM_SIZE:
-                value = _match_dims(key, value, dataset_value, batched)
-                if value.is_sparse:
-                    if not dataset_value.is_sparse:
-                        raise ValueError(f"{key}: cannot mix sparse and non sparse values")
+                value = torch.cat((dataset_value, value))
+                if dataset_value.is_sparse:
                     value = value.coalesce()
-                    indices, values = value.indices(), value.values()
-                    ds_indices, ds_values = dataset_value.indices(), dataset_value.values()
-                    indices[0] += ds_indices[0].max().add(1)
-                    indices = torch.cat((ds_indices, indices), dim=1)
-                    values = torch.cat((ds_values, values), dim=0)
-
-                    value = torch.sparse_coo_tensor(indices, values, indices.amax(dim=1).add(1).unbind(dim=0), is_coalesced=True)
+                dataset[key] = value
+            elif tensor_layout == TensorLayout.VARYING_DIM_SIZE:
+                if value.is_sparse:
+                    sizes = (dataset_value.size(0) + value.size(0),)
+                    for dim in range(1, value.dim()):
+                        sizes = sizes + (max(value.size(dim), dataset_value.size(dim)),)
+                    value = value.coalesce()
+                    indices, values = value._indices(), value._values()
+                    ds_indices, ds_values = dataset_value._indices(), dataset_value._values()
+                    if ds_indices.numel() == indices.numel() == 0:
+                        value = torch.sparse_coo_tensor(indices, values, size=sizes, check_invariants=_CHECK_INVARIANTS)
+                    else:
+                        indices[0] += dataset_value.size(0)
+                        indices = torch.cat((ds_indices, indices), dim=1)
+                        values = torch.cat((ds_values, values), dim=0)
+                        value = torch.sparse_coo_tensor(indices, values, size=sizes, is_coalesced=True, check_invariants=_CHECK_INVARIANTS)
                     dataset[key] = value
                 else:
                     if not dataset_value.is_nested:

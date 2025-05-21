@@ -3,7 +3,7 @@ import pathlib
 from os import PathLike
 from typing import Union
 
-from .safetensors import SafetensorsDataset, ShardedSafetensorsDataset
+from .dict_dataset import SafetensorsDataset, ShardedSafetensorsDataset
 from .safetensors_dict import SafetensorsDict
 from .utils import _load_safetensors_metadata
 
