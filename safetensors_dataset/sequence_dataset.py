@@ -12,7 +12,7 @@ from typing import (
     Sized,
     MutableMapping,
     Sequence,
-    Union,
+    Union, Iterator,
 )
 
 import more_itertools
@@ -68,6 +68,9 @@ class SequenceSafetensorsDataset:
             dataset = CachingIterable(dataset)
 
         self.dataset = dataset
+
+    def __iter__(self) -> Iterator[Mapping[str, Any]]:
+        return iter(self.dataset)
 
     def __contains__(self, item: str):
         # we assume a homogenous dataset,
