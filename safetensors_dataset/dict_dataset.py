@@ -442,7 +442,7 @@ class SafetensorsDataset(torch.utils.data.Dataset):
         if key + ".storage_offsets" in storage:
             storage_offsets = storage[key + ".storage_offsets"]
         else:
-            storage_offsets = sizes.cumsum(dim=0).roll(1).squeeze()
+            storage_offsets = sizes.cumsum(dim=0).roll(1).squeeze(dim=1)
             storage_offsets[0] = 0
         tensor = torch._nested_view_from_buffer(buffer, sizes, strides, storage_offsets)
         return tensor
